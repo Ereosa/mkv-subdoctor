@@ -1,0 +1,11 @@
+# MKV SubDoctor — Python dependencies
+# Install with:  pip install -r requirements.txt
+
+# Required
+langdetect>=1.0.9
+pyspellchecker>=0.7.0
+pillow>=10.0.0          # used for icon creation during install
+
+# Optional — enables OCR language detection for image-based subtitles (PGS/VobSub)
+# Also requires the Tesseract binary: https://github.com/UB-Mannheim/tesseract/wiki
+# pytesseract>=0.3.10
