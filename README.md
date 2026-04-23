@@ -220,4 +220,4 @@ python mkv_subdoctor.py --show-log "Re Zero"
 
 MIT License — see [LICENSE](LICENSE).
 
-The desktop icon (Rem from Re:Zero) is © Tappei Nagatsuki / KADOKAWA. It is downloaded at install time for personal use only and is not redistributed with this software.
+The desktop icon is an original AI-generated image and is not redistributed with this software.
