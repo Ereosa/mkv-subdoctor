@@ -122,6 +122,14 @@ class App(tk.Tk):
         self.geometry("960x780")
         self.minsize(720, 560)
 
+        # Set window icon from rem_icon.ico if available
+        _ico = _SCRIPT_DIR / "rem_icon.ico"
+        if _ico.exists():
+            try:
+                self.iconbitmap(str(_ico))
+            except Exception:
+                pass
+
         self._output_q:   queue.Queue = queue.Queue()
         self._worker:     threading.Thread | None = None
         self._paused:     bool = False

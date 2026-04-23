@@ -28,7 +28,7 @@ env/
 *.ass
 *.ssa
 *.vtt
-rem_icon.ico            # downloaded at install time — not committed
+# rem_icon.ico is now bundled in the repo
 
 # Log files (contain personal media paths)
 Subtitle_Manager_logs/

@@ -6,7 +6,7 @@ Run this once to:
   1. Verify Python version
   2. Install required pip packages
   3. Check for MKVToolNix
-  4. (Optional) download a custom desktop icon
+  4. Set up the bundled desktop icon (or a custom one)
   5. Create a desktop shortcut (Windows)
   6. Create the log directory
 
@@ -17,12 +17,10 @@ Usage:
 """
 
 import argparse
-import io
 import os
 import shutil
 import subprocess
 import sys
-import urllib.request
 from pathlib import Path
 
 # ── Configuration ─────────────────────────────────────────────────────────────
@@ -36,9 +34,7 @@ LOG_DIR_DEFAULT = Path(r"D:\Subtitle_Manager_logs")  # overridable via --log-dir
 MKVTOOLNIX_DL = "https://mkvtoolnix.download/windows/releases/"
 TESSERACT_DL  = "https://github.com/UB-Mannheim/tesseract/wiki"
 
-# Default icon: Rem from Re:Zero (Re:Zero Wiki — for personal use)
-ICON_URL  = ("https://static.wikia.nocookie.net/rezero/images/9/9b/"
-             "Rem_LN_character_design.png/revision/latest?cb=20240412203717")
+# Bundled icon (included in repo)
 ICON_PATH = SCRIPT_DIR / "rem_icon.ico"
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -114,7 +110,7 @@ def check_mkvtoolnix():
 
 # ── Step 4: Icon ──────────────────────────────────────────────────────────────
 
-def download_icon(custom_icon: str | None = None) -> Path | None:
+def setup_icon(custom_icon: str | None = None) -> Path | None:
     _head("Setting up icon")
 
     # User supplied their own .ico
@@ -127,50 +123,14 @@ def download_icon(custom_icon: str | None = None) -> Path | None:
             _warn(f"Custom icon not found or not .ico: {p}  — skipping.")
             return None
 
-    # Already downloaded previously
+    # Use the bundled icon included with the repo
     if ICON_PATH.exists():
-        _ok(f"Icon already exists: {ICON_PATH}")
+        _ok(f"Using bundled icon: {ICON_PATH}")
         return ICON_PATH
 
-    # Download and convert
-    try:
-        from PIL import Image
-    except ImportError:
-        _warn("Pillow not available — cannot create icon.  Run with --no-icon to skip.")
-        return None
-
-    try:
-        print(f"  Downloading icon from Re:Zero wiki...", end=" ", flush=True)
-        req = urllib.request.Request(ICON_URL, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            data = resp.read()
-        print("OK")
-
-        img = Image.open(io.BytesIO(data)).convert("RGBA")
-        # Portrait crop — top square captures face + upper body
-        w, h = img.size
-        side = min(w, h)
-        img  = img.crop((( w - side) // 2, 0, (w - side) // 2 + side, side))
-
-        sizes  = [256, 128, 64, 48, 32, 16]
-        frames = []
-        for s in sizes:
-            canvas = Image.new("RGBA", (s, s), (0, 0, 0, 0))
-            thumb  = img.copy()
-            thumb.thumbnail((s, s), Image.LANCZOS)
-            canvas.paste(thumb, ((s - thumb.width) // 2, (s - thumb.height) // 2))
-            frames.append(canvas)
-
-        frames[0].save(str(ICON_PATH), format="ICO",
-                       sizes=[(s, s) for s in sizes],
-                       append_images=frames[1:])
-        _ok(f"Icon saved: {ICON_PATH}")
-        return ICON_PATH
-
-    except Exception as e:
-        _warn(f"Icon download failed: {e}")
-        _info("You can supply your own with: python install.py --icon youricon.ico")
-        return None
+    _warn("Bundled icon not found — skipping.")
+    _info("You can supply your own with: python install.py --icon youricon.ico")
+    return None
 
 
 # ── Step 5: Log directory ─────────────────────────────────────────────────────
@@ -278,7 +238,7 @@ def main():
 
     icon_path = None
     if not args.no_icon:
-        icon_path = download_icon(custom_icon=args.icon)
+        icon_path = setup_icon(custom_icon=args.icon)
 
     log_dir = Path(args.log_dir)
     create_log_dir(log_dir)
