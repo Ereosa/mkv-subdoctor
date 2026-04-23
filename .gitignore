@@ -20,6 +20,7 @@ env/
 .env/
 
 # Generated / runtime files
+mkv_subdoctor_config.json   # per-user preferences (dark mode etc.)
 *.bak
 *.new.mkv
 *.sup
