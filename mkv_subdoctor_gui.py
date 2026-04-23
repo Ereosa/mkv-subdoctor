@@ -415,12 +415,14 @@ class App(tk.Tk):
         right.columnconfigure(0, weight=1)
 
         # Toggle options
-        self._recursive_var = tk.BooleanVar(value=True)
-        self._dry_run_var   = tk.BooleanVar(value=False)
-        self._no_log_var    = tk.BooleanVar(value=False)
+        self._recursive_var   = tk.BooleanVar(value=True)
+        self._dry_run_var     = tk.BooleanVar(value=False)
+        self._no_log_var      = tk.BooleanVar(value=False)
+        self._spell_check_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(right, text="Recursive",      variable=self._recursive_var).pack(anchor="w", pady=2)
         ttk.Checkbutton(right, text="Dry Run",        variable=self._dry_run_var).pack(anchor="w", pady=2)
         ttk.Checkbutton(right, text="Disable Logging",variable=self._no_log_var).pack(anchor="w", pady=2)
+        ttk.Checkbutton(right, text="Spell Check",    variable=self._spell_check_var).pack(anchor="w", pady=2)
 
         ttk.Separator(right, orient="horizontal").pack(fill="x", pady=8)
 
@@ -665,12 +667,13 @@ class App(tk.Tk):
                 "Add at least one MKV file or folder before starting.")
             return
 
-        keep_langs = self._get_keep_langs()
-        remaps     = self._get_remaps()
-        dry_run    = self._dry_run_var.get()
-        recursive  = self._recursive_var.get()
-        no_log     = self._no_log_var.get()
-        log_dir    = self._log_dir_var.get()
+        keep_langs  = self._get_keep_langs()
+        remaps      = self._get_remaps()
+        dry_run     = self._dry_run_var.get()
+        recursive   = self._recursive_var.get()
+        no_log      = self._no_log_var.get()
+        spell_check = self._spell_check_var.get()
+        log_dir     = self._log_dir_var.get()
 
         # Reset core events
         core._pause_event.set()
@@ -691,7 +694,7 @@ class App(tk.Tk):
 
         self._worker = threading.Thread(
             target=self._worker_func,
-            args=(paths, keep_langs, remaps, dry_run, recursive, no_log, log_dir),
+            args=(paths, keep_langs, remaps, dry_run, recursive, no_log, spell_check, log_dir),
             daemon=True,
         )
         self._worker.start()
@@ -729,7 +732,7 @@ class App(tk.Tk):
 
     # ── Worker thread ─────────────────────────────────────────────────────────
 
-    def _worker_func(self, paths, keep_langs, remaps, dry_run, recursive, no_log, log_dir):
+    def _worker_func(self, paths, keep_langs, remaps, dry_run, recursive, no_log, spell_check, log_dir):
         # Configure logging
         if no_log:
             core._LOG_DIR = None
@@ -771,7 +774,8 @@ class App(tk.Tk):
                     break
                 try:
                     if core.process_mkv(str(f), dry_run=dry_run,
-                                        remap_langs=remaps, keep_langs=keep_langs):
+                                        remap_langs=remaps, keep_langs=keep_langs,
+                                        spell_check=spell_check):
                         modified += 1
                 except Exception as exc:
                     self._output_q.put(f"  UNHANDLED ERROR for '{f}': {exc}\n")

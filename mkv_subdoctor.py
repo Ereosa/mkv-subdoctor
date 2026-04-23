@@ -788,7 +788,8 @@ def build_mkvmerge_cmd(
 
 def process_mkv(mkv_path: str, dry_run: bool = False,
                 remap_langs: dict[str, str] | None = None,
-                keep_langs: frozenset[str] = KEEP_LANGS_DEFAULT) -> bool:
+                keep_langs: frozenset[str] = KEEP_LANGS_DEFAULT,
+                spell_check: bool = True) -> bool:
     label = "[DRY RUN] " if dry_run else ""
     print(f"\n{label}Processing: {mkv_path}")
 
@@ -836,7 +837,7 @@ def process_mkv(mkv_path: str, dry_run: bool = False,
 
         # ── Spell fix SRT tracks ─────────────────────────────────────────────
         total_fixes = 0
-        if not dry_run:
+        if not dry_run and spell_check:
             for a in ordered:
                 if a.extracted_path and a.extracted_path.endswith(".srt"):
                     fixes = fix_spelling_srt(a.extracted_path)
@@ -1113,6 +1114,8 @@ Examples:
                          f"(default: {_LOG_DIR_DEFAULT})")
     ap.add_argument("--no-log", action="store_true",
                     help="Disable change logging for this run")
+    ap.add_argument("--no-spellcheck", action="store_true",
+                    help="Skip spelling correction on SRT/CC tracks")
     ap.add_argument("--show-log", nargs="?", const="", metavar="SERIES",
                     help="Pretty-print logs and exit. "
                          "Optionally filter by series name, e.g. --show-log \"Jack-of-All\"")
@@ -1176,7 +1179,8 @@ Examples:
             break
         try:
             if process_mkv(str(f), dry_run=args.dry_run,
-                           remap_langs=remap_langs, keep_langs=keep_langs):
+                           remap_langs=remap_langs, keep_langs=keep_langs,
+                           spell_check=not args.no_spellcheck):
                 modified += 1
         except Exception as e:
             print(f"  UNHANDLED ERROR for '{f}': {e}")
