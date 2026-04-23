@@ -13,6 +13,7 @@ Features:
   - Live output display with auto-scroll
   - Start / Pause-Resume / Stop controls
   - Per-file progress bar
+  - Dark / Light mode toggle (preference saved between sessions)
 
 Requirements:
   pip install langdetect pyspellchecker pillow
@@ -21,6 +22,7 @@ Requirements:
 """
 
 import contextlib
+import json
 import queue
 import sys
 import threading
@@ -41,6 +43,7 @@ _BMC_URL = "https://buymeacoffee.com/mkvsubdoctor"
 
 _SCRIPT_DIR = Path(__file__).parent
 _BMC_IMG    = _SCRIPT_DIR / "bmc-button.png"
+_CONFIG     = _SCRIPT_DIR / "mkv_subdoctor_config.json"
 sys.path.insert(0, str(_SCRIPT_DIR))
 
 try:
@@ -53,6 +56,40 @@ except ImportError as e:
         f"Could not import mkv_subdoctor.py from:\n{_SCRIPT_DIR}\n\n{e}",
     )
     sys.exit(1)
+
+# ── Colour palettes ───────────────────────────────────────────────────────────
+
+_DARK: dict[str, str] = {
+    "bg":        "#1e1e1e",   # main window / frame background
+    "bg2":       "#252526",   # trough / scrollbar track
+    "bg3":       "#2d2d2d",   # panel / labelframe interior
+    "fg":        "#d4d4d4",   # primary text
+    "entry_bg":  "#3c3c3c",   # text inputs, listboxes
+    "border":    "#454545",   # widget borders
+    "btn_bg":    "#3a3d41",   # button face
+    "btn_act":   "#4e5256",   # button hover/active
+    "sel_bg":    "#264f78",   # selection highlight
+    "sel_fg":    "#ffffff",
+    "out_bg":    "#1e1e1e",   # output ScrolledText
+    "out_fg":    "#c8c8c8",
+    "prog":      "#0078d4",   # progress bar fill
+}
+
+_LIGHT: dict[str, str] = {
+    "bg":        "#f0f0f0",
+    "bg2":       "#ffffff",
+    "bg3":       "#e8e8e8",
+    "fg":        "#000000",
+    "entry_bg":  "#ffffff",
+    "border":    "#aaaaaa",
+    "btn_bg":    "#e1e1e1",
+    "btn_act":   "#c8c8c8",
+    "sel_bg":    "#0078d4",
+    "sel_fg":    "#ffffff",
+    "out_bg":    "#ffffff",
+    "out_fg":    "#000000",
+    "prog":      "#0078d4",
+}
 
 # ── Language menu ─────────────────────────────────────────────────────────────
 
@@ -139,8 +176,123 @@ class App(tk.Tk):
         # Track custom language codes added by the user
         self._custom_langs: set[str] = set()
 
+        # Load saved preference (default: dark mode on)
+        prefs = self._load_prefs()
+        self._dark_mode = tk.BooleanVar(value=prefs.get("dark_mode", True))
+
         self._build_ui()
-        self._poll_output()   # start the 100ms GUI poll loop
+        self._apply_theme()     # paint everything before first draw
+        self._poll_output()     # start the 100ms GUI poll loop
+
+    # ── Preference persistence ────────────────────────────────────────────────
+
+    def _load_prefs(self) -> dict:
+        try:
+            if _CONFIG.exists():
+                return json.loads(_CONFIG.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+        return {}
+
+    def _save_prefs(self):
+        try:
+            prefs = self._load_prefs()
+            prefs["dark_mode"] = self._dark_mode.get()
+            _CONFIG.write_text(
+                json.dumps(prefs, indent=2), encoding="utf-8"
+            )
+        except Exception:
+            pass
+
+    # ── Theme engine ──────────────────────────────────────────────────────────
+
+    def _apply_theme(self):
+        c = _DARK if self._dark_mode.get() else _LIGHT
+
+        # ── ttk style ────────────────────────────────────────────────────────
+        style = ttk.Style(self)
+        style.theme_use("clam")   # clam allows the most colour overrides
+
+        style.configure(".",
+            background=c["bg"],
+            foreground=c["fg"],
+            fieldbackground=c["entry_bg"],
+            troughcolor=c["bg2"],
+            bordercolor=c["border"],
+            darkcolor=c["bg3"],
+            lightcolor=c["bg3"],
+            selectbackground=c["sel_bg"],
+            selectforeground=c["sel_fg"],
+        )
+        style.configure("TFrame",        background=c["bg"])
+        style.configure("TLabel",        background=c["bg"],  foreground=c["fg"])
+        style.configure("TLabelframe",   background=c["bg3"], bordercolor=c["border"],
+                        darkcolor=c["border"], lightcolor=c["border"])
+        style.configure("TLabelframe.Label", background=c["bg3"], foreground=c["fg"])
+        style.configure("TCheckbutton",  background=c["bg"],  foreground=c["fg"],
+                        focuscolor=c["bg"])
+        style.map("TCheckbutton",
+            background=[("active", c["bg"]), ("disabled", c["bg"])],
+            foreground=[("active", c["fg"])])
+        style.configure("TButton",
+            background=c["btn_bg"], foreground=c["fg"],
+            bordercolor=c["border"],
+            darkcolor=c["btn_bg"], lightcolor=c["btn_bg"],
+            padding=(6, 3),
+        )
+        style.map("TButton",
+            background=[("active", c["btn_act"]), ("disabled", c["bg2"])],
+            foreground=[("disabled", c["border"])],
+            darkcolor=[("active", c["btn_act"])],
+            lightcolor=[("active", c["btn_act"])],
+        )
+        style.configure("TEntry",
+            fieldbackground=c["entry_bg"], foreground=c["fg"],
+            insertcolor=c["fg"], bordercolor=c["border"],
+            selectbackground=c["sel_bg"], selectforeground=c["sel_fg"],
+        )
+        style.configure("TScrollbar",
+            background=c["btn_bg"], troughcolor=c["bg2"],
+            arrowcolor=c["fg"], bordercolor=c["border"],
+            darkcolor=c["bg2"], lightcolor=c["bg2"],
+        )
+        style.map("TScrollbar",
+            background=[("active", c["btn_act"])],
+            arrowcolor=[("disabled", c["border"])],
+        )
+        style.configure("TProgressbar",
+            background=c["prog"], troughcolor=c["bg2"],
+            bordercolor=c["border"], darkcolor=c["bg2"], lightcolor=c["bg2"],
+        )
+        style.configure("TSeparator", background=c["border"])
+
+        # ── tk (non-ttk) widgets ──────────────────────────────────────────────
+        self.configure(bg=c["bg"])
+
+        for lb in (self._path_lb, self._remap_lb):
+            lb.configure(
+                bg=c["entry_bg"], fg=c["fg"],
+                selectbackground=c["sel_bg"], selectforeground=c["sel_fg"],
+                highlightbackground=c["border"], highlightcolor=c["border"],
+            )
+
+        self._output_txt.configure(
+            bg=c["out_bg"], fg=c["out_fg"],
+            insertbackground=c["fg"],
+            selectbackground=c["sel_bg"], selectforeground=c["sel_fg"],
+        )
+
+        # Canvas used for the scrollable language checkbox list
+        self._lang_canvas.configure(bg=c["bg3"])
+
+        # BMC label background must match so transparent PNG corners blend in
+        if hasattr(self, "_bmc_label"):
+            self._bmc_label.configure(bg=c["bg"])
+
+        self._save_prefs()
+
+    def _toggle_theme(self):
+        self._apply_theme()
 
     # ── UI construction ───────────────────────────────────────────────────────
 
@@ -212,31 +364,31 @@ class App(tk.Tk):
         lang_frm.rowconfigure(0, weight=1)
 
         # Canvas + scrollbar for the checkbox list
-        canvas = tk.Canvas(lang_frm, highlightthickness=0)
-        canvas.grid(row=0, column=0, sticky="nsew")
-        vsb = ttk.Scrollbar(lang_frm, orient="vertical", command=canvas.yview)
+        self._lang_canvas = tk.Canvas(lang_frm, highlightthickness=0)
+        self._lang_canvas.grid(row=0, column=0, sticky="nsew")
+        vsb = ttk.Scrollbar(lang_frm, orient="vertical", command=self._lang_canvas.yview)
         vsb.grid(row=0, column=1, sticky="ns")
-        canvas.configure(yscrollcommand=vsb.set)
+        self._lang_canvas.configure(yscrollcommand=vsb.set)
 
-        inner = ttk.Frame(canvas)
-        win_id = canvas.create_window((0, 0), window=inner, anchor="nw")
+        inner = ttk.Frame(self._lang_canvas)
+        win_id = self._lang_canvas.create_window((0, 0), window=inner, anchor="nw")
 
         def _on_frame_configure(e):
-            canvas.configure(scrollregion=canvas.bbox("all"))
+            self._lang_canvas.configure(scrollregion=self._lang_canvas.bbox("all"))
         def _on_canvas_configure(e):
-            canvas.itemconfig(win_id, width=e.width)
+            self._lang_canvas.itemconfig(win_id, width=e.width)
 
         inner.bind("<Configure>", _on_frame_configure)
-        canvas.bind("<Configure>", _on_canvas_configure)
+        self._lang_canvas.bind("<Configure>", _on_canvas_configure)
 
         # Mouse-wheel scrolling (bind while cursor is over the canvas)
         def _on_enter(_e):
-            canvas.bind_all("<MouseWheel>",
-                lambda ev: canvas.yview_scroll(-1 * (ev.delta // 120), "units"))
+            self._lang_canvas.bind_all("<MouseWheel>",
+                lambda ev: self._lang_canvas.yview_scroll(-1 * (ev.delta // 120), "units"))
         def _on_leave(_e):
-            canvas.unbind_all("<MouseWheel>")
-        canvas.bind("<Enter>", _on_enter)
-        canvas.bind("<Leave>", _on_leave)
+            self._lang_canvas.unbind_all("<MouseWheel>")
+        self._lang_canvas.bind("<Enter>", _on_enter)
+        self._lang_canvas.bind("<Leave>", _on_leave)
 
         self._lang_vars: dict[str, tk.BooleanVar] = {}
         for label, code in LANGUAGE_OPTIONS:
@@ -349,21 +501,24 @@ class App(tk.Tk):
         self._autoscroll_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(btn_row, text="Auto-scroll",
                         variable=self._autoscroll_var).pack(side="left", padx=8)
+        ttk.Checkbutton(btn_row, text="Dark Mode",
+                        variable=self._dark_mode,
+                        command=self._toggle_theme).pack(side="left", padx=8)
 
         # Buy Me a Coffee button — lower right
         bmc_img = self._load_bmc_image(height=32)
         if bmc_img:
-            bmc = tk.Label(btn_row, image=bmc_img, cursor="hand2",
-                           relief="flat", borderwidth=0)
-            bmc.image = bmc_img   # keep reference so GC doesn't drop it
+            self._bmc_label = tk.Label(btn_row, image=bmc_img, cursor="hand2",
+                                       relief="flat", borderwidth=0)
+            self._bmc_label.image = bmc_img   # keep reference so GC doesn't drop it
         else:
             # Fallback if PIL unavailable or image missing
-            bmc = tk.Label(btn_row, text="☕ Buy Me a Coffee",
-                           foreground="#000000", background="#FFDD00",
-                           font=("Segoe UI", 9, "bold"),
-                           cursor="hand2", padx=8, pady=3)
-        bmc.pack(side="right", padx=(0, 2))
-        bmc.bind("<Button-1>", lambda _: webbrowser.open(_BMC_URL))
+            self._bmc_label = tk.Label(btn_row, text="☕ Buy Me a Coffee",
+                                       foreground="#000000", background="#FFDD00",
+                                       font=("Segoe UI", 9, "bold"),
+                                       cursor="hand2", padx=8, pady=3)
+        self._bmc_label.pack(side="right", padx=(0, 2))
+        self._bmc_label.bind("<Button-1>", lambda _: webbrowser.open(_BMC_URL))
 
     # ── BMC image loader ──────────────────────────────────────────────────────
 
