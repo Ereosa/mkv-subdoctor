@@ -905,10 +905,10 @@ def process_mkv(mkv_path: str, dry_run: bool = False,
             else:
                 # Check whether the default flag is already correct
                 first_audio_props = kept_audio[0].get("properties", {})
-                if not first_audio_props.get("flag_default"):
+                if not first_audio_props.get("default_track"):
                     audio_default_wrong = True
                 for t in kept_audio[1:]:
-                    if t.get("properties", {}).get("flag_default"):
+                    if t.get("properties", {}).get("default_track"):
                         audio_default_wrong = True
                 if audio_default_wrong:
                     print("  Default-track flag is on the wrong audio track — will fix.")
@@ -929,10 +929,10 @@ def process_mkv(mkv_path: str, dry_run: bool = False,
         default_flag_wrong = False
         if ordered:
             first_props = ordered[0].track.get("properties", {})
-            if not first_props.get("flag_default"):
+            if not first_props.get("default_track"):
                 default_flag_wrong = True
             for a in ordered[1:]:
-                if a.track.get("properties", {}).get("flag_default"):
+                if a.track.get("properties", {}).get("default_track"):
                     default_flag_wrong = True
         if default_flag_wrong:
             print("  Default-track flag is on the wrong subtitle — will fix.")
