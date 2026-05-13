@@ -703,22 +703,64 @@ def analyse_subtitle_tracks(
     return results
 
 
+def analyse_audio_tracks(
+    audio_tracks: list[dict],
+    keep_langs: frozenset[str],
+) -> tuple[list[dict], list[dict]]:
+    """
+    Split audio tracks into kept / removed based on language metadata.
+    Tracks tagged 'und' or with no language are always kept (can't verify).
+    Returns (kept, removed).
+    """
+    kept:    list[dict] = []
+    removed: list[dict] = []
+    for track in audio_tracks:
+        props = track.get("properties", {})
+        lang  = props.get("language", "und")
+        norm  = _normalize_lang(lang) if lang not in ("und", "", None) else None
+        codec = track.get("codec", "")
+        name  = props.get("track_name", "")
+        keep  = (norm in keep_langs) if norm else True   # unknown lang → keep
+        label = "KEEP" if keep else "REMOVE"
+        print(f"  Audio #{track['id']}  lang={lang}  codec={codec}"
+              f"{f'  [{name}]' if name else ''}  -> {label}")
+        (kept if keep else removed).append(track)
+    return kept, removed
+
+
 def build_mkvmerge_cmd(
     mkv_path: str,
     out_path: str,
     other_tracks: list[dict],
     ordered_subs: list[AnalysedTrack],
+    kept_audio: list[dict] | None = None,   # None = leave audio untouched
 ) -> list[str]:
     """
     Construct an mkvmerge command that:
+      - Optionally filters audio tracks and sets the default flag
       - Keeps all non-subtitle tracks from the original file
       - Adds back subtitle tracks in the desired order
       - Injects spell-corrected text files where available
     """
     cmd = [MKVMERGE, "-o", out_path]
 
-    # ── File 0: main MKV, no subtitles ──────────────────────────────────────
-    cmd += ["--no-subtitles", mkv_path]
+    # ── Audio filtering flags (applied before the main input file) ───────────
+    audio_pre: list[str] = []
+    removed_audio_ids: set[int] = set()
+    if kept_audio is not None:
+        kept_ids = ",".join(str(t["id"]) for t in kept_audio)
+        audio_pre += ["-a", kept_ids]
+        kept_id_set = {t["id"] for t in kept_audio}
+        removed_audio_ids = {
+            t["id"] for t in other_tracks
+            if t["type"] == "audio" and t["id"] not in kept_id_set
+        }
+        # Default flag: first kept audio = 1, rest = 0
+        for i, t in enumerate(kept_audio):
+            audio_pre += ["--default-track", f"{t['id']}:{'1' if i == 0 else '0'}"]
+
+    # ── File 0: main MKV, no subtitles (audio optionally filtered) ──────────
+    cmd += audio_pre + ["--no-subtitles", mkv_path]
     file_idx = 1
 
     # ── Partition subtitles into "from extracted file" vs "from original" ───
@@ -771,9 +813,10 @@ def build_mkvmerge_cmd(
     # ── Build --track-order ──────────────────────────────────────────────────
     order_parts: list[str] = []
 
-    # Non-subtitle tracks first (video, audio, attachments etc.)
+    # Non-subtitle tracks first (video, audio, attachments etc.) — skip removed audio
     for t in other_tracks:
-        order_parts.append(f"0:{t['id']}")
+        if t["id"] not in removed_audio_ids:
+            order_parts.append(f"0:{t['id']}")
 
     # Subtitle tracks in desired order
     for a in ordered_subs:
@@ -789,7 +832,13 @@ def build_mkvmerge_cmd(
 def process_mkv(mkv_path: str, dry_run: bool = False,
                 remap_langs: dict[str, str] | None = None,
                 keep_langs: frozenset[str] = KEEP_LANGS_DEFAULT,
-                spell_check: bool = True) -> bool:
+                spell_check: bool = True,
+                manage_audio: bool = False,
+                audio_langs: frozenset[str] | None = None) -> bool:
+    """
+    audio_langs: languages to keep for audio tracks. If None, uses keep_langs.
+    manage_audio: if False, audio tracks are left completely untouched.
+    """
     label = "[DRY RUN] " if dry_run else ""
     print(f"\n{label}Processing: {mkv_path}")
 
@@ -801,13 +850,17 @@ def process_mkv(mkv_path: str, dry_run: bool = False,
 
     tracks       = info.get("tracks", [])
     sub_tracks   = [t for t in tracks if t["type"] == "subtitles"]
+    audio_tracks = [t for t in tracks if t["type"] == "audio"]
     other_tracks = [t for t in tracks if t["type"] != "subtitles"]
 
-    if not sub_tracks:
+    if not sub_tracks and not (manage_audio and audio_tracks):
         print("  No subtitle tracks — skipping.")
         return False
 
-    print(f"  {len(sub_tracks)} subtitle track(s) found")
+    if sub_tracks:
+        print(f"  {len(sub_tracks)} subtitle track(s) found")
+    if audio_tracks:
+        print(f"  {len(audio_tracks)} audio track(s) found")
 
     with tempfile.TemporaryDirectory() as tmpdir:
         analysed = analyse_subtitle_tracks(mkv_path, sub_tracks, tmpdir, remap_langs or {}, keep_langs)
@@ -835,6 +888,31 @@ def process_mkv(mkv_path: str, dry_run: bool = False,
                     print(f"  ** Track {a.tid} will be retagged: "
                           f"'{track_lang_tag(a.track)}' -> '{a.effective_lang}'")
 
+        # ── Audio track analysis ─────────────────────────────────────────────
+        kept_audio:    list[dict] | None = None
+        removed_audio: list[dict]        = []
+        audio_default_wrong              = False
+
+        if manage_audio and audio_tracks:
+            eff_audio_langs = audio_langs if audio_langs else keep_langs
+            print(f"  Audio: keeping languages {sorted(eff_audio_langs)}")
+            kept_audio, removed_audio = analyse_audio_tracks(audio_tracks, eff_audio_langs)
+
+            if not kept_audio:
+                print("  WARNING: No audio tracks match — leaving audio unchanged.")
+                kept_audio = None
+                removed_audio = []
+            else:
+                # Check whether the default flag is already correct
+                first_audio_props = kept_audio[0].get("properties", {})
+                if not first_audio_props.get("flag_default"):
+                    audio_default_wrong = True
+                for t in kept_audio[1:]:
+                    if t.get("properties", {}).get("flag_default"):
+                        audio_default_wrong = True
+                if audio_default_wrong:
+                    print("  Default-track flag is on the wrong audio track — will fix.")
+
         # ── Spell fix SRT tracks ─────────────────────────────────────────────
         total_fixes = 0
         if not dry_run and spell_check:
@@ -859,22 +937,30 @@ def process_mkv(mkv_path: str, dry_run: bool = False,
         if default_flag_wrong:
             print("  Default-track flag is on the wrong subtitle — will fix.")
 
-        needs_remux = order_changed or total_fixes > 0 or default_flag_wrong
+        audio_changed = bool(removed_audio) or audio_default_wrong
+        needs_remux   = order_changed or total_fixes > 0 or default_flag_wrong or audio_changed
 
         if not needs_remux:
             print("  No changes required.")
             return False
 
         if dry_run:
-            print(f"  Would remove {removed_count} non-English track(s)")
+            if removed_count:
+                print(f"  Would remove {removed_count} non-kept subtitle track(s)")
             print(f"  New subtitle order: {new_ids}")
+            if removed_audio:
+                print(f"  Would remove {len(removed_audio)} audio track(s): "
+                      f"{[t['id'] for t in removed_audio]}")
+            if audio_default_wrong:
+                print(f"  Would fix audio default-track flag")
             print(f"  (Spelling fix counts require a full run)")
             write_log(mkv_path, analysed, ordered, 0, dry_run=True)
             return True
 
         # ── Remux ────────────────────────────────────────────────────────────
         out_path = mkv_path + ".new.mkv"
-        cmd = build_mkvmerge_cmd(mkv_path, out_path, other_tracks, ordered)
+        cmd = build_mkvmerge_cmd(mkv_path, out_path, other_tracks, ordered,
+                                 kept_audio=kept_audio)
 
         print("  Remuxing …")
         r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8")
@@ -905,10 +991,12 @@ def process_mkv(mkv_path: str, dry_run: bool = False,
 
         kept  = len(ordered)
         total = len(sub_tracks)
+        audio_note = (f" | audio: {len(kept_audio)}/{len(audio_tracks)} kept"
+                      if kept_audio is not None else "")
         print(
-            f"  Done. {kept}/{total} track(s) kept | "
+            f"  Done. {kept}/{total} sub(s) kept | "
             f"{removed_count} removed | {total_fixes} spelling fix(es) | "
-            f"order: {new_ids}"
+            f"order: {new_ids}{audio_note}"
         )
         write_log(mkv_path, analysed, ordered, total_fixes, dry_run=False)
         return True
@@ -1116,6 +1204,11 @@ Examples:
                     help="Disable change logging for this run")
     ap.add_argument("--no-spellcheck", action="store_true",
                     help="Skip spelling correction on SRT/CC tracks")
+    ap.add_argument("--manage-audio", action="store_true",
+                    help="Remove non-matching audio tracks and set the primary track flag")
+    ap.add_argument("--audio-lang", metavar="LANG", action="append", default=[],
+                    help="Audio language(s) to keep (default: same as --keep-lang). "
+                         "Example: --audio-lang en --audio-lang ja")
     ap.add_argument("--show-log", nargs="?", const="", metavar="SERIES",
                     help="Pretty-print logs and exit. "
                          "Optionally filter by series name, e.g. --show-log \"Jack-of-All\"")
@@ -1178,9 +1271,15 @@ Examples:
             print("\nProcessing stopped by user.")
             break
         try:
+            audio_langs: frozenset[str] | None = (
+                frozenset(_normalize_lang(l) for l in args.audio_lang)
+                if args.audio_lang else None
+            )
             if process_mkv(str(f), dry_run=args.dry_run,
                            remap_langs=remap_langs, keep_langs=keep_langs,
-                           spell_check=not args.no_spellcheck):
+                           spell_check=not args.no_spellcheck,
+                           manage_audio=args.manage_audio,
+                           audio_langs=audio_langs):
                 modified += 1
         except Exception as e:
             print(f"  UNHANDLED ERROR for '{f}': {e}")

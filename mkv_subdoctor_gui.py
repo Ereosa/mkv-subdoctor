@@ -269,7 +269,7 @@ class App(tk.Tk):
         # ── tk (non-ttk) widgets ──────────────────────────────────────────────
         self.configure(bg=c["bg"])
 
-        for lb in (self._path_lb, self._remap_lb):
+        for lb in (self._path_lb, self._remap_lb, self._audio_lang_lb):
             lb.configure(
                 bg=c["entry_bg"], fg=c["fg"],
                 selectbackground=c["sel_bg"], selectforeground=c["sel_fg"],
@@ -450,6 +450,49 @@ class App(tk.Tk):
 
         ttk.Separator(right, orient="horizontal").pack(fill="x", pady=8)
 
+        # Audio track management
+        audio_frm = ttk.LabelFrame(right, text="Audio Tracks", padding=4)
+        audio_frm.pack(fill="x", pady=2)
+        audio_frm.columnconfigure(0, weight=1)
+
+        self._manage_audio_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(audio_frm, text="Manage Audio Tracks",
+                        variable=self._manage_audio_var,
+                        command=self._on_manage_audio_toggle).pack(anchor="w")
+
+        self._audio_opts_frm = ttk.Frame(audio_frm)
+        self._audio_opts_frm.pack(fill="x", pady=(4, 0))
+        self._audio_opts_frm.columnconfigure(0, weight=1)
+
+        ttk.Label(self._audio_opts_frm, text="Keep languages:").grid(
+            row=0, column=0, columnspan=3, sticky="w")
+
+        self._audio_lang_lb = tk.Listbox(
+            self._audio_opts_frm, height=3, font=("Consolas", 9))
+        self._audio_lang_lb.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(2, 2))
+        audio_sb = ttk.Scrollbar(self._audio_opts_frm, orient="vertical",
+                                 command=self._audio_lang_lb.yview)
+        audio_sb.grid(row=1, column=2, sticky="ns")
+        self._audio_lang_lb.configure(yscrollcommand=audio_sb.set)
+
+        audio_btn_row = ttk.Frame(self._audio_opts_frm)
+        audio_btn_row.grid(row=2, column=0, columnspan=3, sticky="ew")
+        self._audio_add_var = tk.StringVar()
+        ttk.Entry(audio_btn_row, textvariable=self._audio_add_var,
+                  width=6).pack(side="left")
+        ttk.Button(audio_btn_row, text="Add", width=5,
+                   command=self._audio_add_lang).pack(side="left", padx=2)
+        ttk.Button(audio_btn_row, text="Del", width=5,
+                   command=self._audio_del_lang).pack(side="left", padx=2)
+        ttk.Button(audio_btn_row, text="↑ Match Subtitles", width=16,
+                   command=self._audio_match_subtitles).pack(side="left", padx=(6, 0))
+
+        # Start with "en" as default and disable until checkbox ticked
+        self._audio_lang_lb.insert("end", "en")
+        self._on_manage_audio_toggle()   # set initial disabled state
+
+        ttk.Separator(right, orient="horizontal").pack(fill="x", pady=8)
+
         # Log directory
         ttk.Label(right, text="Log Directory:").pack(anchor="w")
         log_row = ttk.Frame(right)
@@ -598,6 +641,53 @@ class App(tk.Tk):
             langs = {"en"}
         return frozenset(langs)
 
+    # ── Audio helpers ─────────────────────────────────────────────────────────
+
+    def _on_manage_audio_toggle(self):
+        state = "normal" if self._manage_audio_var.get() else "disabled"
+        for child in self._audio_opts_frm.winfo_children():
+            try:
+                child.configure(state=state)
+            except Exception:
+                pass
+            for sub in child.winfo_children():
+                try:
+                    sub.configure(state=state)
+                except Exception:
+                    pass
+
+    def _audio_add_lang(self):
+        raw  = self._audio_add_var.get().strip().lower()
+        code = core._normalize_lang(raw)
+        if not code or code in ("und", "mul"):
+            messagebox.showwarning("Invalid Code",
+                "Enter a valid ISO 639-1 (2-letter) or 639-2 (3-letter) code.")
+            return
+        if code not in self._audio_lang_lb.get(0, "end"):
+            self._audio_lang_lb.insert("end", code)
+        self._audio_add_var.set("")
+
+    def _audio_del_lang(self):
+        for i in reversed(self._audio_lang_lb.curselection()):
+            self._audio_lang_lb.delete(i)
+
+    def _audio_match_subtitles(self):
+        """Copy the current subtitle language selection into the audio list."""
+        langs = sorted(code for code, var in self._lang_vars.items() if var.get())
+        langs += sorted(self._custom_langs)
+        self._audio_lang_lb.delete(0, "end")
+        for lang in langs:
+            self._audio_lang_lb.insert("end", lang)
+
+    def _get_audio_langs(self) -> frozenset[str] | None:
+        """Return frozenset of audio languages, or None if manage_audio is off."""
+        if not self._manage_audio_var.get():
+            return None
+        langs = list(self._audio_lang_lb.get(0, "end"))
+        if not langs:
+            return frozenset({"en"})
+        return frozenset(langs)
+
     # ── Remap helpers ─────────────────────────────────────────────────────────
 
     def _add_remap(self):
@@ -667,13 +757,15 @@ class App(tk.Tk):
                 "Add at least one MKV file or folder before starting.")
             return
 
-        keep_langs  = self._get_keep_langs()
-        remaps      = self._get_remaps()
-        dry_run     = self._dry_run_var.get()
-        recursive   = self._recursive_var.get()
-        no_log      = self._no_log_var.get()
-        spell_check = self._spell_check_var.get()
-        log_dir     = self._log_dir_var.get()
+        keep_langs    = self._get_keep_langs()
+        remaps        = self._get_remaps()
+        dry_run       = self._dry_run_var.get()
+        recursive     = self._recursive_var.get()
+        no_log        = self._no_log_var.get()
+        spell_check   = self._spell_check_var.get()
+        manage_audio  = self._manage_audio_var.get()
+        audio_langs   = self._get_audio_langs()
+        log_dir       = self._log_dir_var.get()
 
         # Reset core events
         core._pause_event.set()
@@ -694,7 +786,8 @@ class App(tk.Tk):
 
         self._worker = threading.Thread(
             target=self._worker_func,
-            args=(paths, keep_langs, remaps, dry_run, recursive, no_log, spell_check, log_dir),
+            args=(paths, keep_langs, remaps, dry_run, recursive, no_log,
+                  spell_check, manage_audio, audio_langs, log_dir),
             daemon=True,
         )
         self._worker.start()
@@ -732,7 +825,8 @@ class App(tk.Tk):
 
     # ── Worker thread ─────────────────────────────────────────────────────────
 
-    def _worker_func(self, paths, keep_langs, remaps, dry_run, recursive, no_log, spell_check, log_dir):
+    def _worker_func(self, paths, keep_langs, remaps, dry_run, recursive, no_log,
+                     spell_check, manage_audio, audio_langs, log_dir):
         # Configure logging
         if no_log:
             core._LOG_DIR = None
@@ -775,7 +869,9 @@ class App(tk.Tk):
                 try:
                     if core.process_mkv(str(f), dry_run=dry_run,
                                         remap_langs=remaps, keep_langs=keep_langs,
-                                        spell_check=spell_check):
+                                        spell_check=spell_check,
+                                        manage_audio=manage_audio,
+                                        audio_langs=audio_langs):
                         modified += 1
                 except Exception as exc:
                     self._output_q.put(f"  UNHANDLED ERROR for '{f}': {exc}\n")
