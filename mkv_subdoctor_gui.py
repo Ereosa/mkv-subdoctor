@@ -418,7 +418,7 @@ class App(tk.Tk):
         self._recursive_var   = tk.BooleanVar(value=True)
         self._dry_run_var     = tk.BooleanVar(value=False)
         self._no_log_var      = tk.BooleanVar(value=False)
-        self._spell_check_var = tk.BooleanVar(value=True)
+        self._spell_check_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(right, text="Recursive",      variable=self._recursive_var).pack(anchor="w", pady=2)
         ttk.Checkbutton(right, text="Dry Run",        variable=self._dry_run_var).pack(anchor="w", pady=2)
         ttk.Checkbutton(right, text="Disable Logging",variable=self._no_log_var).pack(anchor="w", pady=2)
