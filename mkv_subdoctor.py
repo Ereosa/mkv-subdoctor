@@ -928,8 +928,7 @@ def process_mkv(mkv_path: str, dry_run: bool = False,
         removed_count  = len(analysed) - len(english_tracks)
 
         if not english_tracks:
-            print("  WARNING: No English subtitle tracks found — leaving file unchanged.")
-            return False
+            print("  No keep-language subtitle tracks found — removing all subtitle tracks.")
 
         # Ordering: regular → CC/SDH → forced
         regular  = [a for a in english_tracks if not a.cc and not a.forced]
