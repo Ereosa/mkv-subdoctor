@@ -703,6 +703,60 @@ def analyse_subtitle_tracks(
     return results
 
 
+def _preflight_clean(
+    sub_tracks:   list[dict],
+    audio_tracks: list[dict],
+    keep_langs:   frozenset[str],
+    manage_audio: bool,
+    audio_langs:  frozenset[str] | None,
+) -> bool:
+    """
+    Metadata-only pre-flight check.  Returns True only when we are confident
+    nothing needs to change — allowing process_mkv to skip extraction entirely.
+
+    Spell-check is intentionally NOT considered here: it runs opportunistically
+    only when a remux is already required for structural reasons.
+    """
+    # ── Subtitle checks ───────────────────────────────────────────────────────
+    if sub_tracks:
+        # All track language tags must be in keep_langs
+        for t in sub_tracks:
+            lang = _normalize_lang(track_lang_tag(t))
+            if lang not in keep_langs:
+                return False   # has a non-keep track → will need removing
+
+        # Expected order after sorting: regular → CC/SDH → forced
+        regular  = [t for t in sub_tracks if not is_cc_track(t) and not is_forced_track(t)]
+        cc_list  = [t for t in sub_tracks if is_cc_track(t) and not is_forced_track(t)]
+        forced   = [t for t in sub_tracks if is_forced_track(t)]
+        expected_ids = [t["id"] for t in regular + cc_list + forced]
+        if [t["id"] for t in sub_tracks] != expected_ids:
+            return False   # order needs fixing
+
+        # Default flag: first track must be True, rest must be False
+        if not sub_tracks[0].get("properties", {}).get("default_track"):
+            return False
+        for t in sub_tracks[1:]:
+            if t.get("properties", {}).get("default_track"):
+                return False
+
+    # ── Audio checks (only when managing) ────────────────────────────────────
+    if manage_audio and audio_tracks:
+        eff = audio_langs or keep_langs
+        for t in audio_tracks:
+            lang = _normalize_lang(t.get("properties", {}).get("language", "und"))
+            if lang and lang not in eff:
+                return False   # has a non-keep audio track
+        # Default flag: first kept track must be True
+        if not audio_tracks[0].get("properties", {}).get("default_track"):
+            return False
+        for t in audio_tracks[1:]:
+            if t.get("properties", {}).get("default_track"):
+                return False
+
+    return True   # everything looks clean — safe to skip
+
+
 def analyse_audio_tracks(
     audio_tracks: list[dict],
     keep_langs: frozenset[str],
@@ -861,6 +915,11 @@ def process_mkv(mkv_path: str, dry_run: bool = False,
         print(f"  {len(sub_tracks)} subtitle track(s) found")
     if audio_tracks:
         print(f"  {len(audio_tracks)} audio track(s) found")
+
+    # ── Fast-path: skip extraction when metadata already looks clean ─────────
+    if _preflight_clean(sub_tracks, audio_tracks, keep_langs, manage_audio, audio_langs):
+        print("  No changes required.")
+        return False
 
     with tempfile.TemporaryDirectory() as tmpdir:
         analysed = analyse_subtitle_tracks(mkv_path, sub_tracks, tmpdir, remap_langs or {}, keep_langs)
