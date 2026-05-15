@@ -740,19 +740,30 @@ def _preflight_clean(
             if t.get("properties", {}).get("default_track"):
                 return False
 
-    # ── Audio checks (only when managing) ────────────────────────────────────
-    if manage_audio and audio_tracks:
-        eff = audio_langs or keep_langs
-        for t in audio_tracks:
-            lang = _normalize_lang(t.get("properties", {}).get("language", "und"))
-            if lang and lang not in eff:
-                return False   # has a non-keep audio track
-        # Default flag: first kept track must be True
-        if not audio_tracks[0].get("properties", {}).get("default_track"):
-            return False
-        for t in audio_tracks[1:]:
-            if t.get("properties", {}).get("default_track"):
-                return False
+    # ── Audio checks ─────────────────────────────────────────────────────────
+    if audio_tracks:
+        eff = (audio_langs or keep_langs) if manage_audio else keep_langs
+
+        # When managing: all tracks must be in the keep set
+        if manage_audio:
+            for t in audio_tracks:
+                lang = _normalize_lang(t.get("properties", {}).get("language", "und"))
+                if lang and lang not in eff:
+                    return False   # has a non-keep audio track
+
+        # Always: first keep-lang track must carry the default flag
+        first_keep = next(
+            (t for t in audio_tracks
+             if _normalize_lang(t.get("properties", {}).get("language", "und"))
+             in eff),
+            None,
+        )
+        if first_keep:
+            if not first_keep.get("properties", {}).get("default_track"):
+                return False   # wrong track is default
+            for t in audio_tracks:
+                if t is not first_keep and t.get("properties", {}).get("default_track"):
+                    return False   # extra default flags present
 
     return True   # everything looks clean — safe to skip
 
@@ -787,7 +798,8 @@ def build_mkvmerge_cmd(
     out_path: str,
     other_tracks: list[dict],
     ordered_subs: list[AnalysedTrack],
-    kept_audio: list[dict] | None = None,   # None = leave audio untouched
+    kept_audio: list[dict] | None = None,         # None = leave audio untouched
+    audio_default_fixes: dict[int, bool] | None = None,  # tid→bool: fix default flag only
 ) -> list[str]:
     """
     Construct an mkvmerge command that:
@@ -812,6 +824,10 @@ def build_mkvmerge_cmd(
         # Default flag: first kept audio = 1, rest = 0
         for i, t in enumerate(kept_audio):
             audio_pre += ["--default-track", f"{t['id']}:{'1' if i == 0 else '0'}"]
+    elif audio_default_fixes:
+        # No track removal — just correct the default flag without an -a filter
+        for tid, is_default in audio_default_fixes.items():
+            audio_pre += ["--default-track", f"{tid}:{'1' if is_default else '0'}"]
 
     # ── File 0: main MKV, no subtitles (audio optionally filtered) ──────────
     cmd += audio_pre + ["--no-subtitles", mkv_path]
@@ -971,6 +987,29 @@ def process_mkv(mkv_path: str, dry_run: bool = False,
                 if audio_default_wrong:
                     print("  Default-track flag is on the wrong audio track — will fix.")
 
+        # ── Audio default-flag fix (even when manage_audio is off) ──────────
+        audio_default_fixes: dict[int, bool] = {}
+        if kept_audio is None and audio_tracks:
+            # Find the first keep-lang audio track; if it isn't already default, fix it
+            first_keep = next(
+                (t for t in audio_tracks
+                 if _normalize_lang(t.get("properties", {}).get("language", "und"))
+                 in keep_langs),
+                None,
+            )
+            if first_keep:
+                current_default = next(
+                    (t for t in audio_tracks
+                     if t.get("properties", {}).get("default_track")),
+                    None,
+                )
+                if current_default is None or current_default["id"] != first_keep["id"]:
+                    audio_default_wrong = True
+                    for t in audio_tracks:
+                        audio_default_fixes[t["id"]] = (t["id"] == first_keep["id"])
+                    print(f"  Audio default-track flag is wrong — will fix "
+                          f"(track {first_keep['id']} will be set as default).")
+
         # ── Spell fix SRT tracks ─────────────────────────────────────────────
         total_fixes = 0
         if not dry_run and spell_check:
@@ -1018,7 +1057,8 @@ def process_mkv(mkv_path: str, dry_run: bool = False,
         # ── Remux ────────────────────────────────────────────────────────────
         out_path = mkv_path + ".new.mkv"
         cmd = build_mkvmerge_cmd(mkv_path, out_path, other_tracks, ordered,
-                                 kept_audio=kept_audio)
+                                 kept_audio=kept_audio,
+                                 audio_default_fixes=audio_default_fixes or None)
 
         print("  Remuxing …")
         r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8")
