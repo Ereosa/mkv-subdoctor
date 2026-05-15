@@ -919,6 +919,34 @@ def build_mkvmerge_cmd(
     return cmd
 
 
+def _is_file_locked(path: str) -> bool:
+    """
+    Return True if the file cannot be renamed (i.e. it is held open by another
+    process without FILE_SHARE_DELETE — the exact condition that causes the
+    atomic-replace step to fail with WinError 32).
+
+    Uses a round-trip rename as the test: rename to a temp name and straight
+    back.  If either rename raises OSError the file is in use.  The window
+    between the two renames is microseconds; the original name is restored even
+    if the second rename unexpectedly fails.
+    """
+    tmp = path + ".lcktest"
+    try:
+        os.rename(path, tmp)
+    except OSError:
+        return True          # can't even start the rename — file is locked
+    try:
+        os.rename(tmp, path)
+    except OSError:
+        # Very unlikely; try to leave things consistent
+        try:
+            os.rename(tmp, path)
+        except OSError:
+            pass
+        return True
+    return False
+
+
 def process_mkv(mkv_path: str, dry_run: bool = False,
                 remap_langs: dict[str, str] | None = None,
                 keep_langs: frozenset[str] = KEEP_LANGS_DEFAULT,
@@ -935,6 +963,13 @@ def process_mkv(mkv_path: str, dry_run: bool = False,
     """
     label = "[DRY RUN] " if dry_run else ""
     print(f"\n{label}Processing: {mkv_path}")
+
+    # Check for file locks before spending time on extraction / remux.
+    # Skip dry-run: we never rename in dry-run mode so the test is unnecessary.
+    if not dry_run and _is_file_locked(mkv_path):
+        print("  SKIPPED — file is locked by another process "
+              "(close Plex / media player and re-run).")
+        return False
 
     try:
         info = mkv_json(mkv_path)
