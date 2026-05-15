@@ -468,6 +468,15 @@ def is_forced_track(track: dict) -> bool:
     name = props.get("track_name", "").lower()
     return any(m in name for m in FORCED_MARKERS)
 
+
+def _preferred_first(tracks: list, lang: str | None) -> list:
+    """Move tracks of the preferred language to the front, preserving relative order."""
+    if not lang:
+        return tracks
+    pref  = [t for t in tracks if _normalize_lang(t.effective_lang) == lang]
+    other = [t for t in tracks if _normalize_lang(t.effective_lang) != lang]
+    return pref + other
+
 # ── Spelling correction (SRT only) ────────────────────────────────────────────
 
 # Lines that must not be spell-checked
@@ -704,15 +713,18 @@ def analyse_subtitle_tracks(
 
 
 def _preflight_clean(
-    sub_tracks:   list[dict],
-    audio_tracks: list[dict],
-    keep_langs:   frozenset[str],
-    manage_audio: bool,
-    audio_langs:  frozenset[str] | None,
-) -> bool:
+    sub_tracks:          list[dict],
+    audio_tracks:        list[dict],
+    keep_langs:          frozenset[str],
+    manage_audio:        bool,
+    audio_langs:         frozenset[str] | None,
+    preferred_sub_lang:  str | None = None,
+    preferred_audio_lang: str | None = None,
+) -> str | None:
     """
-    Metadata-only pre-flight check.  Returns True only when we are confident
-    nothing needs to change — allowing process_mkv to skip extraction entirely.
+    Metadata-only pre-flight check.
+    Returns None when nothing needs to change (safe to skip extraction).
+    Returns a short reason string when a full analysis is required.
 
     Spell-check is intentionally NOT considered here: it runs opportunistically
     only when a remux is already required for structural reasons.
@@ -723,38 +735,62 @@ def _preflight_clean(
         for t in sub_tracks:
             lang = _normalize_lang(track_lang_tag(t))
             if lang not in keep_langs:
-                return False   # has a non-keep track → will need removing
+                return f"subtitle track {t['id']} lang={lang!r} not in keep set"
 
-        # Expected order after sorting: regular → CC/SDH → forced
-        regular  = [t for t in sub_tracks if not is_cc_track(t) and not is_forced_track(t)]
-        cc_list  = [t for t in sub_tracks if is_cc_track(t) and not is_forced_track(t)]
-        forced   = [t for t in sub_tracks if is_forced_track(t)]
+        # Expected order: (preferred lang first within each group) regular → CC → forced
+        regular = [t for t in sub_tracks if not is_cc_track(t) and not is_forced_track(t)]
+        cc_list = [t for t in sub_tracks if is_cc_track(t) and not is_forced_track(t)]
+        forced  = [t for t in sub_tracks if is_forced_track(t)]
+
+        # Apply preferred-lang ordering within each group
+        if preferred_sub_lang:
+            def _pref(lst):
+                p = [t for t in lst if _normalize_lang(track_lang_tag(t)) == preferred_sub_lang]
+                o = [t for t in lst if _normalize_lang(track_lang_tag(t)) != preferred_sub_lang]
+                return p + o
+            regular = _pref(regular)
+            cc_list = _pref(cc_list)
+            forced  = _pref(forced)
+
         expected_ids = [t["id"] for t in regular + cc_list + forced]
         if [t["id"] for t in sub_tracks] != expected_ids:
-            return False   # order needs fixing
+            return f"subtitle track order is wrong (got {[t['id'] for t in sub_tracks]}, want {expected_ids})"
 
         # Default flag: first track must be True, rest must be False
         if not sub_tracks[0].get("properties", {}).get("default_track"):
-            return False
+            return f"subtitle track {sub_tracks[0]['id']} should be default but isn't"
         for t in sub_tracks[1:]:
             if t.get("properties", {}).get("default_track"):
-                return False
+                return f"subtitle track {t['id']} has default_track set but shouldn't"
 
     # ── Audio checks (only when managing) ────────────────────────────────────
     if manage_audio and audio_tracks:
         eff = audio_langs or keep_langs
+
+        # All kept tracks must be in the language set
         for t in audio_tracks:
             lang = _normalize_lang(t.get("properties", {}).get("language", "und"))
             if lang and lang not in eff:
-                return False   # has a non-keep audio track
-        # Default flag: first kept track must be True
-        if not audio_tracks[0].get("properties", {}).get("default_track"):
-            return False
-        for t in audio_tracks[1:]:
-            if t.get("properties", {}).get("default_track"):
-                return False
+                return f"audio track {t['id']} lang={lang!r} not in keep set"
 
-    return True   # everything looks clean — safe to skip
+        # Build the expected kept list (preserving order, with preferred first)
+        kept = [t for t in audio_tracks
+                if _normalize_lang(t.get("properties", {}).get("language", "und")) in eff
+                or not t.get("properties", {}).get("language")]
+        if preferred_audio_lang and kept:
+            pref  = [t for t in kept if _normalize_lang(t.get("properties", {}).get("language", "und")) == preferred_audio_lang]
+            other = [t for t in kept if t not in pref]
+            kept  = pref + other
+
+        if kept:
+            # First kept track must have default_track = True
+            if not kept[0].get("properties", {}).get("default_track"):
+                return f"audio track {kept[0]['id']} should be default but isn't"
+            for t in kept[1:]:
+                if t.get("properties", {}).get("default_track"):
+                    return f"audio track {t['id']} has default_track set but shouldn't"
+
+    return None   # everything looks clean — safe to skip
 
 
 def analyse_audio_tracks(
@@ -888,10 +924,14 @@ def process_mkv(mkv_path: str, dry_run: bool = False,
                 keep_langs: frozenset[str] = KEEP_LANGS_DEFAULT,
                 spell_check: bool = True,
                 manage_audio: bool = False,
-                audio_langs: frozenset[str] | None = None) -> bool:
+                audio_langs: frozenset[str] | None = None,
+                preferred_sub_lang: str | None = None,
+                preferred_audio_lang: str | None = None) -> bool:
     """
-    audio_langs: languages to keep for audio tracks. If None, uses keep_langs.
-    manage_audio: if False, audio tracks are left completely untouched.
+    audio_langs:          languages to keep for audio tracks. If None, uses keep_langs.
+    manage_audio:         if False, audio tracks are left completely untouched.
+    preferred_sub_lang:   ISO 639-1 code — this language's subtitle tracks go first.
+    preferred_audio_lang: ISO 639-1 code — this language's audio tracks go first.
     """
     label = "[DRY RUN] " if dry_run else ""
     print(f"\n{label}Processing: {mkv_path}")
@@ -917,7 +957,11 @@ def process_mkv(mkv_path: str, dry_run: bool = False,
         print(f"  {len(audio_tracks)} audio track(s) found")
 
     # ── Fast-path: skip extraction when metadata already looks clean ─────────
-    if _preflight_clean(sub_tracks, audio_tracks, keep_langs, manage_audio, audio_langs):
+    _preflight_reason = _preflight_clean(
+        sub_tracks, audio_tracks, keep_langs, manage_audio, audio_langs,
+        preferred_sub_lang, preferred_audio_lang,
+    )
+    if _preflight_reason is None:
         print("  No changes required.")
         return False
 
@@ -930,10 +974,13 @@ def process_mkv(mkv_path: str, dry_run: bool = False,
         if not english_tracks:
             print("  No keep-language subtitle tracks found — removing all subtitle tracks.")
 
-        # Ordering: regular → CC/SDH → forced
+        # Ordering: regular → CC/SDH → forced, preferred language first within each group
         regular  = [a for a in english_tracks if not a.cc and not a.forced]
         cc_list  = [a for a in english_tracks if a.cc and not a.forced]
         forced   = [a for a in english_tracks if a.forced]
+        regular  = _preferred_first(regular, preferred_sub_lang)
+        cc_list  = _preferred_first(cc_list,  preferred_sub_lang)
+        forced   = _preferred_first(forced,   preferred_sub_lang)
         ordered  = regular + cc_list + forced
 
         original_ids  = [a.tid for a in analysed]
@@ -961,6 +1008,14 @@ def process_mkv(mkv_path: str, dry_run: bool = False,
                 kept_audio = None
                 removed_audio = []
             else:
+                # Apply preferred-language ordering
+                if preferred_audio_lang:
+                    pref  = [t for t in kept_audio
+                             if _normalize_lang(t.get("properties", {}).get("language", "und"))
+                             == preferred_audio_lang]
+                    other = [t for t in kept_audio if t not in pref]
+                    kept_audio = pref + other
+
                 # Check whether the default flag is already correct
                 first_audio_props = kept_audio[0].get("properties", {})
                 if not first_audio_props.get("default_track"):
@@ -999,7 +1054,8 @@ def process_mkv(mkv_path: str, dry_run: bool = False,
         needs_remux   = order_changed or total_fixes > 0 or default_flag_wrong or audio_changed
 
         if not needs_remux:
-            print("  No changes required.")
+            print(f"  No changes required.  "
+                  f"(Pre-flight triggered full analysis: {_preflight_reason})")
             return False
 
         if dry_run:
@@ -1267,6 +1323,12 @@ Examples:
     ap.add_argument("--audio-lang", metavar="LANG", action="append", default=[],
                     help="Audio language(s) to keep (default: same as --keep-lang). "
                          "Example: --audio-lang en --audio-lang ja")
+    ap.add_argument("--primary-sub-lang", metavar="LANG", default=None,
+                    help="Preferred subtitle language — its tracks go first (ISO 639-1). "
+                         "Example: --primary-sub-lang en")
+    ap.add_argument("--primary-audio-lang", metavar="LANG", default=None,
+                    help="Preferred audio language — its tracks go first (ISO 639-1). "
+                         "Example: --primary-audio-lang en")
     ap.add_argument("--show-log", nargs="?", const="", metavar="SERIES",
                     help="Pretty-print logs and exit. "
                          "Optionally filter by series name, e.g. --show-log \"Jack-of-All\"")
@@ -1337,7 +1399,9 @@ Examples:
                            remap_langs=remap_langs, keep_langs=keep_langs,
                            spell_check=not args.no_spellcheck,
                            manage_audio=args.manage_audio,
-                           audio_langs=audio_langs):
+                           audio_langs=audio_langs,
+                           preferred_sub_lang=_normalize_lang(args.primary_sub_lang) if args.primary_sub_lang else None,
+                           preferred_audio_lang=_normalize_lang(args.primary_audio_lang) if args.primary_audio_lang else None):
                 modified += 1
         except Exception as e:
             print(f"  UNHANDLED ERROR for '{f}': {e}")

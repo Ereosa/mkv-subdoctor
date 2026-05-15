@@ -409,6 +409,17 @@ class App(tk.Tk):
         self._custom_lang_display = ttk.Label(cust, text="", foreground="gray")
         self._custom_lang_display.pack(side="left", padx=6)
 
+        # Primary (preferred) subtitle language selector
+        prim = ttk.Frame(lang_frm)
+        prim.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(4, 0))
+        ttk.Label(prim, text="Primary lang:").pack(side="left")
+        self._sub_primary_var = tk.StringVar(value="(auto)")
+        self._sub_primary_cb = ttk.Combobox(
+            prim, textvariable=self._sub_primary_var, width=8, state="readonly")
+        self._sub_primary_cb["postcommand"] = self._update_sub_primary_options
+        self._sub_primary_cb.pack(side="left", padx=4)
+        ttk.Label(prim, text="default track language").pack(side="left")
+
     def _build_right_options(self, parent):
         right = ttk.Frame(parent)
         right.grid(row=0, column=1, sticky="nsew", pady=3)
@@ -486,6 +497,17 @@ class App(tk.Tk):
                    command=self._audio_del_lang).pack(side="left", padx=2)
         ttk.Button(audio_btn_row, text="↑ Match Subtitles", width=16,
                    command=self._audio_match_subtitles).pack(side="left", padx=(6, 0))
+
+        # Primary (preferred) audio language selector
+        audio_prim_row = ttk.Frame(self._audio_opts_frm)
+        audio_prim_row.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(4, 0))
+        ttk.Label(audio_prim_row, text="Primary lang:").pack(side="left")
+        self._audio_primary_var = tk.StringVar(value="(auto)")
+        self._audio_primary_cb = ttk.Combobox(
+            audio_prim_row, textvariable=self._audio_primary_var, width=8, state="readonly")
+        self._audio_primary_cb["postcommand"] = self._update_audio_primary_options
+        self._audio_primary_cb.pack(side="left", padx=4)
+        ttk.Label(audio_prim_row, text="default track language").pack(side="left")
 
         # Start with "en" as default and disable until checkbox ticked
         self._audio_lang_lb.insert("end", "en")
@@ -679,6 +701,23 @@ class App(tk.Tk):
         for lang in langs:
             self._audio_lang_lb.insert("end", lang)
 
+    def _update_sub_primary_options(self):
+        """Populate the subtitle primary combobox with currently-selected languages."""
+        langs = sorted(code for code, var in self._lang_vars.items() if var.get())
+        langs += sorted(self._custom_langs)
+        options = ["(auto)"] + langs
+        self._sub_primary_cb["values"] = options
+        if self._sub_primary_var.get() not in options:
+            self._sub_primary_var.set("(auto)")
+
+    def _update_audio_primary_options(self):
+        """Populate the audio primary combobox with currently-listed audio languages."""
+        langs = list(self._audio_lang_lb.get(0, "end"))
+        options = ["(auto)"] + langs
+        self._audio_primary_cb["values"] = options
+        if self._audio_primary_var.get() not in options:
+            self._audio_primary_var.set("(auto)")
+
     def _get_audio_langs(self) -> frozenset[str] | None:
         """Return frozenset of audio languages, or None if manage_audio is off."""
         if not self._manage_audio_var.get():
@@ -757,15 +796,19 @@ class App(tk.Tk):
                 "Add at least one MKV file or folder before starting.")
             return
 
-        keep_langs    = self._get_keep_langs()
-        remaps        = self._get_remaps()
-        dry_run       = self._dry_run_var.get()
-        recursive     = self._recursive_var.get()
-        no_log        = self._no_log_var.get()
-        spell_check   = self._spell_check_var.get()
-        manage_audio  = self._manage_audio_var.get()
-        audio_langs   = self._get_audio_langs()
-        log_dir       = self._log_dir_var.get()
+        keep_langs         = self._get_keep_langs()
+        remaps             = self._get_remaps()
+        dry_run            = self._dry_run_var.get()
+        recursive          = self._recursive_var.get()
+        no_log             = self._no_log_var.get()
+        spell_check        = self._spell_check_var.get()
+        manage_audio       = self._manage_audio_var.get()
+        audio_langs        = self._get_audio_langs()
+        log_dir            = self._log_dir_var.get()
+        _sp = self._sub_primary_var.get()
+        _ap = self._audio_primary_var.get()
+        preferred_sub_lang   = None if _sp  == "(auto)" else _sp
+        preferred_audio_lang = None if _ap  == "(auto)" else _ap
 
         # Reset core events
         core._pause_event.set()
@@ -787,7 +830,8 @@ class App(tk.Tk):
         self._worker = threading.Thread(
             target=self._worker_func,
             args=(paths, keep_langs, remaps, dry_run, recursive, no_log,
-                  spell_check, manage_audio, audio_langs, log_dir),
+                  spell_check, manage_audio, audio_langs, log_dir,
+                  preferred_sub_lang, preferred_audio_lang),
             daemon=True,
         )
         self._worker.start()
@@ -826,7 +870,8 @@ class App(tk.Tk):
     # ── Worker thread ─────────────────────────────────────────────────────────
 
     def _worker_func(self, paths, keep_langs, remaps, dry_run, recursive, no_log,
-                     spell_check, manage_audio, audio_langs, log_dir):
+                     spell_check, manage_audio, audio_langs, log_dir,
+                     preferred_sub_lang=None, preferred_audio_lang=None):
         # Configure logging
         if no_log:
             core._LOG_DIR = None
@@ -871,7 +916,9 @@ class App(tk.Tk):
                                         remap_langs=remaps, keep_langs=keep_langs,
                                         spell_check=spell_check,
                                         manage_audio=manage_audio,
-                                        audio_langs=audio_langs):
+                                        audio_langs=audio_langs,
+                                        preferred_sub_lang=preferred_sub_lang,
+                                        preferred_audio_lang=preferred_audio_lang):
                         modified += 1
                 except Exception as exc:
                     self._output_q.put(f"  UNHANDLED ERROR for '{f}': {exc}\n")
