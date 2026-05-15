@@ -284,6 +284,8 @@ class App(tk.Tk):
 
         # Canvas used for the scrollable language checkbox list
         self._lang_canvas.configure(bg=c["bg3"])
+        # Canvas used for the scrollable right options panel
+        self._right_canvas.configure(bg=c["bg"])
 
         # BMC label background must match so transparent PNG corners blend in
         if hasattr(self, "_bmc_label"):
@@ -421,9 +423,34 @@ class App(tk.Tk):
         ttk.Label(prim, text="default track language").pack(side="left")
 
     def _build_right_options(self, parent):
-        right = ttk.Frame(parent)
-        right.grid(row=0, column=1, sticky="nsew", pady=3)
+        # Outer container sits in the grid cell
+        outer = ttk.Frame(parent)
+        outer.grid(row=0, column=1, sticky="nsew", pady=3)
+        outer.columnconfigure(0, weight=1)
+        outer.rowconfigure(0, weight=1)
+
+        # Scrollable canvas so content stays accessible at any window height
+        self._right_canvas = tk.Canvas(outer, highlightthickness=0)
+        self._right_canvas.grid(row=0, column=0, sticky="nsew")
+        _vsb = ttk.Scrollbar(outer, orient="vertical", command=self._right_canvas.yview)
+        _vsb.grid(row=0, column=1, sticky="ns")
+        self._right_canvas.configure(yscrollcommand=_vsb.set)
+
+        right = ttk.Frame(self._right_canvas)
         right.columnconfigure(0, weight=1)
+        _win_id = self._right_canvas.create_window((0, 0), window=right, anchor="nw")
+
+        right.bind("<Configure>",
+                   lambda e: self._right_canvas.configure(
+                       scrollregion=self._right_canvas.bbox("all")))
+        self._right_canvas.bind("<Configure>",
+                                lambda e: self._right_canvas.itemconfig(_win_id, width=e.width))
+
+        # Mouse-wheel scrolling while the cursor is over the panel
+        self._right_canvas.bind("<Enter>", lambda _e: self._right_canvas.bind_all(
+            "<MouseWheel>",
+            lambda ev: self._right_canvas.yview_scroll(-1 * (ev.delta // 120), "units")))
+        self._right_canvas.bind("<Leave>", lambda _e: self._right_canvas.unbind_all("<MouseWheel>"))
 
         # Toggle options
         self._recursive_var   = tk.BooleanVar(value=True)
