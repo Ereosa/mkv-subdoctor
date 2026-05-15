@@ -29,6 +29,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -921,29 +922,43 @@ def build_mkvmerge_cmd(
 
 def _is_file_locked(path: str) -> bool:
     """
-    Return True if the file cannot be renamed (i.e. it is held open by another
-    process without FILE_SHARE_DELETE — the exact condition that causes the
-    atomic-replace step to fail with WinError 32).
+    Return True if the file cannot be renamed — i.e. another process holds it
+    open without FILE_SHARE_DELETE (the exact cause of WinError 32 during the
+    atomic-replace step).
 
-    Uses a round-trip rename as the test: rename to a temp name and straight
-    back.  If either rename raises OSError the file is in use.  The window
-    between the two renames is microseconds; the original name is restored even
-    if the second rename unexpectedly fails.
+    On Windows we use CreateFileW to request DELETE access.  If a media
+    scanner (Plex, etc.) has the file open without granting delete-sharing,
+    the call fails with ERROR_SHARING_VIOLATION — no rename, no filesystem
+    event, no Plex rescan triggered.
+
+    On non-Windows platforms rename is generally safe even with open files,
+    so we always return False there.
     """
-    tmp = path + ".lcktest"
-    try:
-        os.rename(path, tmp)
-    except OSError:
-        return True          # can't even start the rename — file is locked
-    try:
-        os.rename(tmp, path)
-    except OSError:
-        # Very unlikely; try to leave things consistent
-        try:
-            os.rename(tmp, path)
-        except OSError:
-            pass
-        return True
+    if sys.platform != "win32":
+        return False
+
+    import ctypes
+
+    _DELETE                = 0x00010000
+    _FILE_SHARE_READ       = 0x00000001
+    _FILE_SHARE_WRITE      = 0x00000002
+    _FILE_SHARE_DELETE     = 0x00000004
+    _OPEN_EXISTING         = 3
+    _FILE_ATTRIBUTE_NORMAL = 0x00000080
+    _INVALID_HANDLE        = ctypes.c_void_p(-1).value
+
+    handle = ctypes.windll.kernel32.CreateFileW(
+        path,
+        _DELETE,                                              # access we need for rename
+        _FILE_SHARE_READ | _FILE_SHARE_WRITE | _FILE_SHARE_DELETE,  # we share freely
+        None,
+        _OPEN_EXISTING,
+        _FILE_ATTRIBUTE_NORMAL,
+        None,
+    )
+    if handle == _INVALID_HANDLE:
+        return True     # sharing violation — file is held without delete-share
+    ctypes.windll.kernel32.CloseHandle(handle)
     return False
 
 
@@ -1124,10 +1139,32 @@ def process_mkv(mkv_path: str, dry_run: bool = False,
         if r.returncode == 1 and r.stderr:
             print(f"  Warnings:\n{r.stderr.strip()}")
 
-        # ── Atomic replace ───────────────────────────────────────────────────
+        # ── Atomic replace (with retry for transient file locks) ─────────────
+        # Plex and media players typically hold files for only a second or two
+        # during a metadata scan.  Retrying a handful of times handles this
+        # cleanly without needing to hold a lock that would also block mkvmerge.
         bak = mkv_path + ".bak"
+        _RENAME_RETRIES = 6
+        _RENAME_DELAY   = 5   # seconds between attempts
+
+        renamed = False
+        for attempt in range(_RENAME_RETRIES):
+            try:
+                os.rename(mkv_path, bak)
+                renamed = True
+                break
+            except OSError as e:
+                if attempt < _RENAME_RETRIES - 1:
+                    print(f"  File in use — waiting {_RENAME_DELAY}s then retrying "
+                          f"({attempt + 1}/{_RENAME_RETRIES - 1})…")
+                    time.sleep(_RENAME_DELAY)
+                else:
+                    print(f"  ERROR replacing file after {_RENAME_RETRIES} attempts: {e}")
+                    if os.path.exists(out_path):
+                        os.remove(out_path)
+                    return False
+
         try:
-            os.rename(mkv_path, bak)
             os.rename(out_path, mkv_path)
             os.remove(bak)
         except OSError as e:
