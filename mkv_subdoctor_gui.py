@@ -534,7 +534,7 @@ class App(tk.Tk):
             audio_prim_row, textvariable=self._audio_primary_var, width=8, state="readonly")
         self._audio_primary_cb["postcommand"] = self._update_audio_primary_options
         self._audio_primary_cb.pack(side="left", padx=4)
-        ttk.Label(audio_prim_row, text="default track language").pack(side="left")
+        ttk.Label(audio_prim_row, text="(auto = original release language)").pack(side="left")
 
         # Start with "en" as default and disable until checkbox ticked
         self._audio_lang_lb.insert("end", "en")

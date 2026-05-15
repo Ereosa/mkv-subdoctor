@@ -478,6 +478,32 @@ def _preferred_first(tracks: list, lang: str | None) -> list:
     other = [t for t in tracks if _normalize_lang(t.effective_lang) != lang]
     return pref + other
 
+
+def _resolve_preferred_audio(
+    audio_tracks: list[dict],
+    eff_keep:     frozenset[str],
+    explicit:     str | None,
+) -> str | None:
+    """
+    Return the effective preferred audio language.
+
+    If the user set an explicit preference, honour it.
+    Otherwise auto-detect from the first audio track in the original file:
+    the first track is almost always the original release language
+    (Japanese for anime, English for western releases, etc.), so this
+    gives correct per-file behaviour with zero manual configuration.
+
+    Returns None when the language is unknown or not in the keep set.
+    """
+    if explicit:
+        return explicit
+    if not audio_tracks:
+        return None
+    lang = _normalize_lang(
+        audio_tracks[0].get("properties", {}).get("language", "und")
+    )
+    return lang if (lang and lang != "und" and lang in eff_keep) else None
+
 # ── Spelling correction (SRT only) ────────────────────────────────────────────
 
 # Lines that must not be spell-checked
@@ -778,8 +804,9 @@ def _preflight_clean(
         kept = [t for t in audio_tracks
                 if _normalize_lang(t.get("properties", {}).get("language", "und")) in eff
                 or not t.get("properties", {}).get("language")]
-        if preferred_audio_lang and kept:
-            pref  = [t for t in kept if _normalize_lang(t.get("properties", {}).get("language", "und")) == preferred_audio_lang]
+        eff_pref = _resolve_preferred_audio(audio_tracks, eff, preferred_audio_lang)
+        if eff_pref and kept:
+            pref  = [t for t in kept if _normalize_lang(t.get("properties", {}).get("language", "und")) == eff_pref]
             other = [t for t in kept if t not in pref]
             kept  = pref + other
 
@@ -1058,13 +1085,20 @@ def process_mkv(mkv_path: str, dry_run: bool = False,
                 kept_audio = None
                 removed_audio = []
             else:
-                # Apply preferred-language ordering
-                if preferred_audio_lang:
+                # Apply preferred-language ordering.
+                # If no explicit preference, auto-detect from the first track in
+                # the original file (Japanese for anime, English for western, etc.)
+                eff_audio_pref = _resolve_preferred_audio(
+                    audio_tracks, eff_audio_langs, preferred_audio_lang)
+                if eff_audio_pref:
                     pref  = [t for t in kept_audio
                              if _normalize_lang(t.get("properties", {}).get("language", "und"))
-                             == preferred_audio_lang]
+                             == eff_audio_pref]
                     other = [t for t in kept_audio if t not in pref]
                     kept_audio = pref + other
+                    if preferred_audio_lang is None and eff_audio_pref:
+                        print(f"  Auto-detected original audio language: {eff_audio_pref!r} "
+                              f"(first track in file) — setting as default.")
 
                 # Check whether the default flag is already correct
                 first_audio_props = kept_audio[0].get("properties", {})
