@@ -3,8 +3,9 @@
 mkv_subdoctor_gui.py  —  MKV SubDoctor (GUI)
 
 Graphical front-end for mkv_subdoctor.py.
+Includes integrated Video Converter powered by ffmpeg.
 
-Features:
+Features — Track Manager:
   - File / folder selector
   - Multi-language keep selection (checkboxes + custom code entry)
   - Language remap pairs (for mislabeled image tracks)
@@ -15,21 +16,36 @@ Features:
   - Per-file progress bar
   - Dark / Light mode toggle (preference saved between sessions)
 
+Features — Video Converter:
+  - Batch video conversion with ffmpeg
+  - 5 built-in presets (Shield Optimal, Plex Universal, 1080p Web, 4K HEVC Archive, Custom)
+  - Hardware acceleration (NVIDIA NVENC, Intel QSV, AMD AMF)
+  - Configurable container, codec, CRF, resolution, audio, subtitles
+  - Skip already compatible files option
+  - Real-time per-file progress in treeview
+
 Requirements:
   pip install langdetect pyspellchecker pillow
   MKVToolNix in PATH or default install location
+  ffmpeg / ffprobe in PATH or C:\\ffmpeg\\bin
   mkv_subdoctor.py in the same folder as this script
 """
 
 import contextlib
 import json
+import os
 import queue
+import re
+import shutil
+import subprocess
 import sys
 import threading
 import tkinter as tk
 import webbrowser
+from dataclasses import dataclass
 from pathlib import Path
 from tkinter import filedialog, messagebox, scrolledtext, ttk
+from typing import List, Optional
 
 try:
     from PIL import Image as _PILImage, ImageTk as _ImageTk
@@ -70,9 +86,14 @@ _DARK: dict[str, str] = {
     "btn_act":   "#4e5256",   # button hover/active
     "sel_bg":    "#264f78",   # selection highlight
     "sel_fg":    "#ffffff",
-    "out_bg":    "#1e1e1e",   # output ScrolledText
+    "out_bg":    "#1e1e1e",   # output ScrolledText / log
     "out_fg":    "#c8c8c8",
     "prog":      "#0078d4",   # progress bar fill
+    "accent":    "#89b4fa",   # blue accent (headings, labels)
+    "success":   "#a6e3a1",   # green (done)
+    "error_fg":  "#f38ba8",   # red (error)
+    "warn":      "#fab387",   # orange (converting / warning)
+    "muted":     "#6c7086",   # grey (skipped / cancelled)
 }
 
 _LIGHT: dict[str, str] = {
@@ -89,6 +110,11 @@ _LIGHT: dict[str, str] = {
     "out_bg":    "#ffffff",
     "out_fg":    "#000000",
     "prog":      "#0078d4",
+    "accent":    "#0063b1",
+    "success":   "#107c10",
+    "error_fg":  "#c42b1c",
+    "warn":      "#ca5010",
+    "muted":     "#767676",
 }
 
 # ── Language menu ─────────────────────────────────────────────────────────────
@@ -128,6 +154,71 @@ LANGUAGE_OPTIONS: list[tuple[str, str]] = [
     ("Greek",                  "el"),
 ]
 
+# ── Video Converter constants ─────────────────────────────────────────────────
+
+VIDEO_EXTENSIONS = {
+    ".mkv", ".avi", ".mov", ".wmv", ".flv", ".webm",
+    ".m4v", ".ts", ".mp4", ".m2ts", ".mts", ".divx", ".vob", ".ogv",
+}
+
+PRESETS = {
+    "Shield Optimal": {
+        "desc": "NVIDIA Shield direct-play: H.265 MKV, AC3/DTS passthrough",
+        "container": "mkv",  "vcodec": "libx265", "crf": 20, "preset": "fast",
+        "acodec": "copy",    "abitrate": "320k",  "resolution": "original",
+        "subtitle": "copy",  "skip_compatible": True,
+    },
+    "Plex Universal": {
+        "desc": "Broadest client compatibility: H.264 MP4, AAC stereo",
+        "container": "mp4",  "vcodec": "libx264", "crf": 18, "preset": "medium",
+        "acodec": "aac",     "abitrate": "192k",  "resolution": "original",
+        "subtitle": "copy",  "skip_compatible": True,
+    },
+    "1080p Web": {
+        "desc": "Cap at 1080p, H.264 MP4 — good for remote streaming",
+        "container": "mp4",  "vcodec": "libx264", "crf": 20, "preset": "medium",
+        "acodec": "aac",     "abitrate": "192k",  "resolution": "1920x1080",
+        "subtitle": "copy",  "skip_compatible": False,
+    },
+    "4K HEVC Archive": {
+        "desc": "High-quality archive: H.265 MKV at original resolution",
+        "container": "mkv",  "vcodec": "libx265", "crf": 18, "preset": "slow",
+        "acodec": "copy",    "abitrate": "320k",  "resolution": "original",
+        "subtitle": "copy",  "skip_compatible": True,
+    },
+    "Custom": {
+        "desc": "Configure all settings manually below",
+        "container": "mp4",  "vcodec": "libx264", "crf": 18, "preset": "medium",
+        "acodec": "aac",     "abitrate": "192k",  "resolution": "original",
+        "subtitle": "copy",  "skip_compatible": True,
+    },
+}
+
+# ── FileInfo dataclass ────────────────────────────────────────────────────────
+
+@dataclass
+class FileInfo:
+    path: Path
+    video_codec: str  = "—"
+    audio_codec: str  = "—"
+    resolution:  str  = "—"
+    duration:    float = 0.0
+    size_mb:     float = 0.0
+    status:      str  = "Pending"
+    progress:    float = 0.0
+    row_id:      str  = ""
+
+    @property
+    def is_plex_compatible(self) -> bool:
+        container = self.path.suffix.lower()
+        vc = self.video_codec.lower()
+        ac = self.audio_codec.lower()
+        return (
+            container in {".mp4", ".mkv", ".mov"}
+            and vc in {"h264", "hevc", "h265", "av1"}
+            and ac in {"aac", "mp3", "ac3", "eac3", "dts", "opus", "flac", "truehd"}
+        )
+
 # ── Stdout redirector ─────────────────────────────────────────────────────────
 
 class _QueueStream:
@@ -156,10 +247,9 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("MKV SubDoctor")
-        self.geometry("960x780")
-        self.minsize(720, 560)
+        self.geometry("1100x820")
+        self.minsize(900, 640)
 
-        # Set window icon from rem_icon.ico if available
         _ico = _SCRIPT_DIR / "rem_icon.ico"
         if _ico.exists():
             try:
@@ -167,22 +257,31 @@ class App(tk.Tk):
             except Exception:
                 pass
 
+        # Track Manager state
         self._output_q:   queue.Queue = queue.Queue()
         self._worker:     threading.Thread | None = None
         self._paused:     bool = False
         self._total:      int  = 0
         self._done:       int  = 0
-
-        # Track custom language codes added by the user
         self._custom_langs: set[str] = set()
+
+        # Video Converter state
+        self._conv_files:        List[FileInfo]             = []
+        self._conv_converting:   bool                       = False
+        self._conv_stop_flag:    threading.Event            = threading.Event()
+        self._conv_log_q:        queue.Queue                = queue.Queue()
+        self._conv_current_proc: Optional[subprocess.Popen] = None
+        self._ffmpeg  = self._find_exe("ffmpeg")
+        self._ffprobe = self._find_exe("ffprobe")
+        self._conv_probe_sem = threading.Semaphore(4)
 
         # Load saved preference (default: dark mode on)
         prefs = self._load_prefs()
         self._dark_mode = tk.BooleanVar(value=prefs.get("dark_mode", True))
 
         self._build_ui()
-        self._apply_theme()     # paint everything before first draw
-        self._poll_output()     # start the 100ms GUI poll loop
+        self._apply_theme()
+        self._poll_output()
 
     # ── Preference persistence ────────────────────────────────────────────────
 
@@ -204,6 +303,22 @@ class App(tk.Tk):
         except Exception:
             pass
 
+    # ── ffmpeg / ffprobe discovery ────────────────────────────────────────────
+
+    def _find_exe(self, name: str) -> Optional[str]:
+        found = shutil.which(name)
+        if found:
+            return found
+        candidates = [
+            rf"C:\ffmpeg\bin\{name}.exe",
+            rf"C:\Program Files\ffmpeg\bin\{name}.exe",
+            rf"C:\Program Files (x86)\ffmpeg\bin\{name}.exe",
+        ]
+        for p in candidates:
+            if os.path.exists(p):
+                return p
+        return None
+
     # ── Theme engine ──────────────────────────────────────────────────────────
 
     def _apply_theme(self):
@@ -211,7 +326,7 @@ class App(tk.Tk):
 
         # ── ttk style ────────────────────────────────────────────────────────
         style = ttk.Style(self)
-        style.theme_use("clam")   # clam allows the most colour overrides
+        style.theme_use("clam")
 
         style.configure(".",
             background=c["bg"],
@@ -234,6 +349,11 @@ class App(tk.Tk):
         style.map("TCheckbutton",
             background=[("active", c["bg"]), ("disabled", c["bg"])],
             foreground=[("active", c["fg"])])
+        style.configure("TRadiobutton",  background=c["bg"],  foreground=c["fg"],
+                        focuscolor=c["bg"])
+        style.map("TRadiobutton",
+            background=[("active", c["bg"])],
+            foreground=[("active", c["fg"])])
         style.configure("TButton",
             background=c["btn_bg"], foreground=c["fg"],
             bordercolor=c["border"],
@@ -246,10 +366,35 @@ class App(tk.Tk):
             darkcolor=[("active", c["btn_act"])],
             lightcolor=[("active", c["btn_act"])],
         )
+        style.configure("Accent.TButton",
+            background=c["accent"], foreground=c["bg"],
+            font=("Segoe UI", 9, "bold"), padding=(10, 5),
+        )
+        style.map("Accent.TButton",
+            background=[("active", c["sel_bg"]), ("disabled", c["bg2"])],
+            foreground=[("disabled", c["border"])],
+        )
+        style.configure("Danger.TButton",
+            background=c["error_fg"], foreground=c["bg"],
+            font=("Segoe UI", 9, "bold"), padding=(10, 5),
+        )
+        style.map("Danger.TButton",
+            background=[("active", c["warn"]), ("disabled", c["bg2"])],
+            foreground=[("disabled", c["border"])],
+        )
         style.configure("TEntry",
             fieldbackground=c["entry_bg"], foreground=c["fg"],
             insertcolor=c["fg"], bordercolor=c["border"],
             selectbackground=c["sel_bg"], selectforeground=c["sel_fg"],
+        )
+        style.configure("TCombobox",
+            fieldbackground=c["entry_bg"], background=c["btn_bg"],
+            foreground=c["fg"], arrowcolor=c["fg"],
+            selectbackground=c["entry_bg"], selectforeground=c["fg"],
+        )
+        style.map("TCombobox",
+            fieldbackground=[("readonly", c["entry_bg"])],
+            background=[("readonly", c["btn_bg"])],
         )
         style.configure("TScrollbar",
             background=c["btn_bg"], troughcolor=c["bg2"],
@@ -264,7 +409,37 @@ class App(tk.Tk):
             background=c["prog"], troughcolor=c["bg2"],
             bordercolor=c["border"], darkcolor=c["bg2"], lightcolor=c["bg2"],
         )
+        style.configure("Horizontal.TProgressbar",
+            background=c["prog"], troughcolor=c["bg2"],
+            thickness=10,
+        )
         style.configure("TSeparator", background=c["border"])
+        style.configure("TNotebook",
+            background=c["bg2"], tabmargins=0,
+        )
+        style.configure("TNotebook.Tab",
+            background=c["bg3"], foreground=c["fg"],
+            padding=(14, 6),
+        )
+        style.map("TNotebook.Tab",
+            background=[("selected", c["bg"])],
+            foreground=[("selected", c["fg"])],
+        )
+        style.configure("Treeview",
+            background=c["bg2"], foreground=c["fg"],
+            fieldbackground=c["bg2"], rowheight=26,
+        )
+        style.configure("Treeview.Heading",
+            background=c["bg3"], foreground=c["accent"],
+            font=("Segoe UI", 9, "bold"), relief="flat",
+        )
+        style.map("Treeview",
+            background=[("selected", c["sel_bg"])],
+            foreground=[("selected", c["sel_fg"])],
+        )
+        style.configure("TScale",
+            background=c["bg"], troughcolor=c["bg3"],
+        )
 
         # ── tk (non-ttk) widgets ──────────────────────────────────────────────
         self.configure(bg=c["bg"])
@@ -282,14 +457,34 @@ class App(tk.Tk):
             selectbackground=c["sel_bg"], selectforeground=c["sel_fg"],
         )
 
-        # Canvas used for the scrollable language checkbox list
         self._lang_canvas.configure(bg=c["bg3"])
-        # Canvas used for the scrollable right options panel
         self._right_canvas.configure(bg=c["bg"])
 
-        # BMC label background must match so transparent PNG corners blend in
         if hasattr(self, "_bmc_label"):
             self._bmc_label.configure(bg=c["bg"])
+
+        # Video Converter tk widgets
+        if hasattr(self, "_conv_log_text"):
+            self._conv_log_text.configure(
+                bg=c["out_bg"], fg=c["out_fg"],
+                insertbackground=c["fg"],
+            )
+        if hasattr(self, "_conv_settings_canvas"):
+            self._conv_settings_canvas.configure(bg=c["bg"])
+        if hasattr(self, "_conv_ffmpeg_lbl"):
+            ok_color = c["success"] if self._ffmpeg else c["error_fg"]
+            self._conv_ffmpeg_lbl.configure(bg=c["bg3"], fg=ok_color)
+        if hasattr(self, "_conv_crf_lbl"):
+            self._conv_crf_lbl.configure(bg=c["bg"], fg=c["accent"])
+        if hasattr(self, "_conv_preset_desc_lbl"):
+            self._conv_preset_desc_lbl.configure(bg=c["bg3"], fg=c["muted"])
+        if hasattr(self, "_conv_tree"):
+            self._conv_tree.tag_configure("done",       foreground=c["success"])
+            self._conv_tree.tag_configure("error",      foreground=c["error_fg"])
+            self._conv_tree.tag_configure("converting", foreground=c["warn"])
+            self._conv_tree.tag_configure("skipped",    foreground=c["muted"])
+            self._conv_tree.tag_configure("cancelled",  foreground=c["muted"])
+            self._conv_tree.tag_configure("pending",    foreground=c["fg"])
 
         self._save_prefs()
 
@@ -300,11 +495,30 @@ class App(tk.Tk):
 
     def _build_ui(self):
         self.columnconfigure(0, weight=1)
-        self.rowconfigure(0, weight=3)   # files + options panels
-        self.rowconfigure(1, weight=0)   # control bar
-        self.rowconfigure(2, weight=4)   # output
+        self.rowconfigure(0, weight=1)
 
-        top = ttk.Frame(self, padding=5)
+        self._notebook = ttk.Notebook(self, padding=0)
+        self._notebook.grid(row=0, column=0, sticky="nsew", padx=5, pady=5)
+
+        # Tab 1: Track Manager
+        tab1 = ttk.Frame(self._notebook)
+        self._notebook.add(tab1, text="  Track Manager  ")
+        self._build_track_manager_tab(tab1)
+
+        # Tab 2: Video Converter
+        tab2 = ttk.Frame(self._notebook)
+        self._notebook.add(tab2, text="  Video Converter  ")
+        self._build_video_converter_tab(tab2)
+
+    # ── Tab 1: Track Manager ──────────────────────────────────────────────────
+
+    def _build_track_manager_tab(self, parent):
+        parent.columnconfigure(0, weight=1)
+        parent.rowconfigure(0, weight=3)   # files + options
+        parent.rowconfigure(1, weight=0)   # controls bar
+        parent.rowconfigure(2, weight=4)   # output
+
+        top = ttk.Frame(parent, padding=5)
         top.grid(row=0, column=0, sticky="nsew")
         top.columnconfigure(0, weight=1)
         top.columnconfigure(1, weight=1)
@@ -312,8 +526,8 @@ class App(tk.Tk):
 
         self._build_files_panel(top)
         self._build_options_panel(top)
-        self._build_controls()
-        self._build_output()
+        self._build_controls(parent)
+        self._build_output(parent)
 
     # -- Files panel -----------------------------------------------------------
 
@@ -323,7 +537,6 @@ class App(tk.Tk):
         frm.columnconfigure(0, weight=1)
         frm.rowconfigure(0, weight=1)
 
-        # Listbox + scrollbar
         lbf = ttk.Frame(frm)
         lbf.grid(row=0, column=0, sticky="nsew")
         lbf.columnconfigure(0, weight=1)
@@ -338,7 +551,6 @@ class App(tk.Tk):
         sb_h.grid(row=1, column=0, sticky="ew")
         self._path_lb.configure(yscrollcommand=sb.set, xscrollcommand=sb_h.set)
 
-        # Side buttons
         bf = ttk.Frame(frm)
         bf.grid(row=0, column=1, sticky="n", padx=(6, 0))
         ttk.Button(bf, text="Add Files…",  command=self._add_files,   width=13).pack(fill="x", pady=2)
@@ -365,7 +577,6 @@ class App(tk.Tk):
         lang_frm.columnconfigure(0, weight=1)
         lang_frm.rowconfigure(0, weight=1)
 
-        # Canvas + scrollbar for the checkbox list
         self._lang_canvas = tk.Canvas(lang_frm, highlightthickness=0)
         self._lang_canvas.grid(row=0, column=0, sticky="nsew")
         vsb = ttk.Scrollbar(lang_frm, orient="vertical", command=self._lang_canvas.yview)
@@ -383,7 +594,6 @@ class App(tk.Tk):
         inner.bind("<Configure>", _on_frame_configure)
         self._lang_canvas.bind("<Configure>", _on_canvas_configure)
 
-        # Mouse-wheel scrolling (bind while cursor is over the canvas)
         def _on_enter(_e):
             self._lang_canvas.bind_all("<MouseWheel>",
                 lambda ev: self._lang_canvas.yview_scroll(-1 * (ev.delta // 120), "units"))
@@ -423,13 +633,11 @@ class App(tk.Tk):
         ttk.Label(prim, text="default track language").pack(side="left")
 
     def _build_right_options(self, parent):
-        # Outer container sits in the grid cell
         outer = ttk.Frame(parent)
         outer.grid(row=0, column=1, sticky="nsew", pady=3)
         outer.columnconfigure(0, weight=1)
         outer.rowconfigure(0, weight=1)
 
-        # Scrollable canvas so content stays accessible at any window height
         self._right_canvas = tk.Canvas(outer, highlightthickness=0)
         self._right_canvas.grid(row=0, column=0, sticky="nsew")
         _vsb = ttk.Scrollbar(outer, orient="vertical", command=self._right_canvas.yview)
@@ -446,7 +654,6 @@ class App(tk.Tk):
         self._right_canvas.bind("<Configure>",
                                 lambda e: self._right_canvas.itemconfig(_win_id, width=e.width))
 
-        # Mouse-wheel scrolling while the cursor is over the panel
         self._right_canvas.bind("<Enter>", lambda _e: self._right_canvas.bind_all(
             "<MouseWheel>",
             lambda ev: self._right_canvas.yview_scroll(-1 * (ev.delta // 120), "units")))
@@ -457,10 +664,10 @@ class App(tk.Tk):
         self._dry_run_var     = tk.BooleanVar(value=False)
         self._no_log_var      = tk.BooleanVar(value=False)
         self._spell_check_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(right, text="Recursive",      variable=self._recursive_var).pack(anchor="w", pady=2)
-        ttk.Checkbutton(right, text="Dry Run",        variable=self._dry_run_var).pack(anchor="w", pady=2)
-        ttk.Checkbutton(right, text="Disable Logging",variable=self._no_log_var).pack(anchor="w", pady=2)
-        ttk.Checkbutton(right, text="Spell Check",    variable=self._spell_check_var).pack(anchor="w", pady=2)
+        ttk.Checkbutton(right, text="Recursive",       variable=self._recursive_var).pack(anchor="w", pady=2)
+        ttk.Checkbutton(right, text="Dry Run",         variable=self._dry_run_var).pack(anchor="w", pady=2)
+        ttk.Checkbutton(right, text="Disable Logging", variable=self._no_log_var).pack(anchor="w", pady=2)
+        ttk.Checkbutton(right, text="Spell Check",     variable=self._spell_check_var).pack(anchor="w", pady=2)
 
         ttk.Separator(right, orient="horizontal").pack(fill="x", pady=8)
 
@@ -509,7 +716,7 @@ class App(tk.Tk):
             self._audio_opts_frm, height=3, font=("Consolas", 9))
         self._audio_lang_lb.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(2, 2))
         audio_sb = ttk.Scrollbar(self._audio_opts_frm, orient="vertical",
-                                 command=self._audio_lang_lb.yview)
+                                  command=self._audio_lang_lb.yview)
         audio_sb.grid(row=1, column=2, sticky="ns")
         self._audio_lang_lb.configure(yscrollcommand=audio_sb.set)
 
@@ -536,9 +743,8 @@ class App(tk.Tk):
         self._audio_primary_cb.pack(side="left", padx=4)
         ttk.Label(audio_prim_row, text="(auto = original release language)").pack(side="left")
 
-        # Start with "en" as default and disable until checkbox ticked
         self._audio_lang_lb.insert("end", "en")
-        self._on_manage_audio_toggle()   # set initial disabled state
+        self._on_manage_audio_toggle()
 
         ttk.Separator(right, orient="horizontal").pack(fill="x", pady=8)
 
@@ -554,8 +760,8 @@ class App(tk.Tk):
 
     # -- Controls bar ----------------------------------------------------------
 
-    def _build_controls(self):
-        bar = ttk.Frame(self, padding=(5, 3))
+    def _build_controls(self, parent):
+        bar = ttk.Frame(parent, padding=(5, 3))
         bar.grid(row=1, column=0, sticky="ew")
 
         self._start_btn = ttk.Button(bar, text="  Start",        command=self._start,        width=12)
@@ -577,8 +783,8 @@ class App(tk.Tk):
 
     # -- Output area -----------------------------------------------------------
 
-    def _build_output(self):
-        out_frm = ttk.LabelFrame(self, text="Output", padding=5)
+    def _build_output(self, parent):
+        out_frm = ttk.LabelFrame(parent, text="Output", padding=5)
         out_frm.grid(row=2, column=0, sticky="nsew", padx=5, pady=(0, 5))
         out_frm.columnconfigure(0, weight=1)
         out_frm.rowconfigure(0, weight=1)
@@ -599,14 +805,12 @@ class App(tk.Tk):
                         variable=self._dark_mode,
                         command=self._toggle_theme).pack(side="left", padx=8)
 
-        # Buy Me a Coffee button — lower right
         bmc_img = self._load_bmc_image(height=32)
         if bmc_img:
             self._bmc_label = tk.Label(btn_row, image=bmc_img, cursor="hand2",
                                        relief="flat", borderwidth=0)
-            self._bmc_label.image = bmc_img   # keep reference so GC doesn't drop it
+            self._bmc_label.image = bmc_img
         else:
-            # Fallback if PIL unavailable or image missing
             self._bmc_label = tk.Label(btn_row, text="☕ Buy Me a Coffee",
                                        foreground="#000000", background="#FFDD00",
                                        font=("Segoe UI", 9, "bold"),
@@ -614,22 +818,289 @@ class App(tk.Tk):
         self._bmc_label.pack(side="right", padx=(0, 2))
         self._bmc_label.bind("<Button-1>", lambda _: webbrowser.open(_BMC_URL))
 
+    # ── Tab 2: Video Converter ────────────────────────────────────────────────
+
+    def _build_video_converter_tab(self, parent):
+        parent.columnconfigure(0, weight=1)
+        parent.rowconfigure(0, weight=0)   # toolbar
+        parent.rowconfigure(1, weight=1)   # paned window (file list + settings)
+        parent.rowconfigure(2, weight=0)   # log panel
+
+        self._build_conv_toolbar(parent)
+        self._build_conv_paned(parent)
+        self._build_conv_log(parent)
+
+    def _build_conv_toolbar(self, parent):
+        bar = ttk.Frame(parent, padding=(6, 6))
+        bar.grid(row=0, column=0, sticky="ew")
+
+        ttk.Button(bar, text="＋ Add Files",  command=self._conv_add_files).pack(side="left", padx=(0, 4))
+        ttk.Button(bar, text="＋ Add Folder", command=self._conv_add_folder).pack(side="left", padx=(0, 4))
+        ttk.Button(bar, text="✕ Remove",      command=self._conv_remove_selected).pack(side="left", padx=(0, 4))
+        ttk.Button(bar, text="Clear All",     command=self._conv_clear_all).pack(side="left", padx=(0, 16))
+
+        # ffmpeg status badge (tk.Label so we can colour it)
+        lbl_text = "  ffmpeg ✓  " if self._ffmpeg else "  ffmpeg ✗ NOT FOUND  "
+        self._conv_ffmpeg_lbl = tk.Label(
+            bar, text=lbl_text,
+            font=("Segoe UI", 8, "bold"), padx=6, pady=3, relief="flat",
+        )
+        self._conv_ffmpeg_lbl.pack(side="left")
+
+        self._conv_stop_btn = ttk.Button(
+            bar, text="■  Stop", style="Danger.TButton",
+            command=self._conv_stop, state="disabled",
+        )
+        self._conv_stop_btn.pack(side="right")
+
+        self._conv_start_btn = ttk.Button(
+            bar, text="▶  Start Conversion", style="Accent.TButton",
+            command=self._conv_start,
+        )
+        self._conv_start_btn.pack(side="right", padx=(0, 6))
+
+    def _build_conv_paned(self, parent):
+        pw = ttk.PanedWindow(parent, orient="horizontal")
+        pw.grid(row=1, column=0, sticky="nsew", padx=6, pady=(0, 4))
+
+        self._build_conv_file_panel(pw)
+        self._build_conv_settings_panel(pw)
+
+    def _build_conv_file_panel(self, parent):
+        frame = ttk.Frame(parent)
+        parent.add(frame, weight=3)
+        frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(0, weight=1)
+
+        cols   = ("File", "Resolution", "Video", "Audio", "Size", "Status", "Progress")
+        widths = (260, 95, 80, 80, 72, 84, 100)
+
+        self._conv_tree = ttk.Treeview(frame, columns=cols, show="headings",
+                                        selectmode="extended")
+        for col, w in zip(cols, widths):
+            self._conv_tree.heading(col, text=col,
+                                    command=lambda c=col: self._conv_sort_tree(c))
+            self._conv_tree.column(col, width=w, minwidth=50, stretch=(col == "File"))
+
+        vsb = ttk.Scrollbar(frame, orient="vertical",   command=self._conv_tree.yview)
+        hsb = ttk.Scrollbar(frame, orient="horizontal", command=self._conv_tree.xview)
+        self._conv_tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+
+        self._conv_tree.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        hsb.grid(row=1, column=0, sticky="ew")
+
+        # Overall progress bar
+        pf = ttk.Frame(frame)
+        pf.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        ttk.Label(pf, text="Overall:").pack(side="left", padx=(0, 6))
+        self._conv_overall_bar = ttk.Progressbar(
+            pf, mode="determinate", style="Horizontal.TProgressbar")
+        self._conv_overall_bar.pack(side="left", fill="x", expand=True, padx=(0, 6))
+        self._conv_overall_lbl = ttk.Label(pf, text="0 / 0", width=9)
+        self._conv_overall_lbl.pack(side="left")
+
+        # Tree tag colours (set again by _apply_theme)
+        self._conv_tree.tag_configure("done",       foreground="#a6e3a1")
+        self._conv_tree.tag_configure("error",      foreground="#f38ba8")
+        self._conv_tree.tag_configure("converting", foreground="#fab387")
+        self._conv_tree.tag_configure("skipped",    foreground="#6c7086")
+        self._conv_tree.tag_configure("cancelled",  foreground="#6c7086")
+        self._conv_tree.tag_configure("pending",    foreground="#d4d4d4")
+
+    def _build_conv_settings_panel(self, parent):
+        outer = ttk.Frame(parent)
+        parent.add(outer, weight=1)
+
+        self._conv_settings_canvas = tk.Canvas(
+            outer, highlightthickness=0, width=270)
+        sb = ttk.Scrollbar(outer, orient="vertical",
+                           command=self._conv_settings_canvas.yview)
+        self._conv_settings_canvas.configure(yscrollcommand=sb.set)
+        self._conv_settings_canvas.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+
+        inner = ttk.Frame(self._conv_settings_canvas)
+        win_id = self._conv_settings_canvas.create_window((0, 0), window=inner, anchor="nw")
+        inner.bind("<Configure>",
+                   lambda e: self._conv_settings_canvas.configure(
+                       scrollregion=self._conv_settings_canvas.bbox("all")))
+        self._conv_settings_canvas.bind("<Configure>",
+            lambda e: self._conv_settings_canvas.itemconfig(win_id, width=e.width))
+
+        # Scoped mouse-wheel: only scroll settings canvas when cursor is over it
+        self._conv_settings_canvas.bind("<Enter>", lambda _e:
+            self._conv_settings_canvas.bind_all("<MouseWheel>",
+                lambda ev: self._conv_settings_canvas.yview_scroll(
+                    -1 * (ev.delta // 120), "units")))
+        self._conv_settings_canvas.bind("<Leave>", lambda _e:
+            self._conv_settings_canvas.unbind_all("<MouseWheel>"))
+
+        self._build_conv_settings_content(inner)
+
+    def _build_conv_settings_content(self, p):
+        pad = {"padx": 8, "pady": 4}
+        W   = 22  # combobox width
+
+        # -- Preset selector --
+        pf = ttk.LabelFrame(p, text="Preset")
+        pf.pack(fill="x", **pad)
+
+        self._conv_preset_var = tk.StringVar(value="Shield Optimal")
+        cb = ttk.Combobox(pf, textvariable=self._conv_preset_var,
+                          values=list(PRESETS.keys()), state="readonly", width=W)
+        cb.pack(fill="x", padx=6, pady=(4, 2))
+        cb.bind("<<ComboboxSelected>>", self._conv_apply_preset)
+
+        self._conv_preset_desc_lbl = tk.Label(
+            pf, text="", font=("Segoe UI", 8),
+            wraplength=230, justify="left")
+        self._conv_preset_desc_lbl.pack(fill="x", padx=6, pady=(0, 4))
+
+        # -- Output directory --
+        of = ttk.LabelFrame(p, text="Output Directory")
+        of.pack(fill="x", **pad)
+        self._conv_output_var = tk.StringVar(value="Same as source")
+        row = ttk.Frame(of)
+        row.pack(fill="x", padx=6, pady=4)
+        ttk.Entry(row, textvariable=self._conv_output_var).pack(
+            side="left", fill="x", expand=True, padx=(0, 4))
+        ttk.Button(row, text="Browse", command=self._conv_browse_output).pack(side="right")
+
+        # -- Container --
+        cf = ttk.LabelFrame(p, text="Container Format")
+        cf.pack(fill="x", **pad)
+        self._conv_container_var = tk.StringVar(value="mkv")
+        for text, val in [("MKV  (best codec/audio support)", "mkv"),
+                           ("MP4  (widest client support)",   "mp4")]:
+            ttk.Radiobutton(cf, text=text,
+                            variable=self._conv_container_var, value=val).pack(
+                anchor="w", padx=8, pady=2)
+
+        # -- Video --
+        vf = ttk.LabelFrame(p, text="Video")
+        vf.pack(fill="x", **pad)
+        vf.columnconfigure(1, weight=1)
+
+        ttk.Label(vf, text="Codec:").grid(row=0, column=0, sticky="w", padx=6, pady=3)
+        self._conv_vcodec_var = tk.StringVar(value="libx265")
+        self._conv_vcodec_cb = ttk.Combobox(
+            vf, textvariable=self._conv_vcodec_var, width=W, state="readonly",
+            values=["libx264  (H.264)",
+                    "libx265  (H.265/HEVC)",
+                    "copy  (no re-encode)"])
+        self._conv_vcodec_cb.grid(row=0, column=1, padx=6, pady=3, sticky="ew")
+        self._conv_vcodec_cb.bind("<<ComboboxSelected>>", self._conv_normalise_vcodec)
+
+        ttk.Label(vf, text="Quality (CRF):").grid(row=1, column=0, sticky="w", padx=6, pady=3)
+        crf_row = ttk.Frame(vf)
+        crf_row.grid(row=1, column=1, padx=6, pady=3, sticky="ew")
+        self._conv_crf_var = tk.IntVar(value=20)
+        self._conv_crf_lbl = tk.Label(
+            crf_row, text="20", width=3,
+            font=("Segoe UI", 9, "bold"))
+        self._conv_crf_lbl.pack(side="right")
+        ttk.Scale(crf_row, from_=0, to=51, variable=self._conv_crf_var,
+                  command=lambda v: self._conv_crf_lbl.config(
+                      text=str(int(float(v))))).pack(
+            side="left", fill="x", expand=True)
+
+        ttk.Label(vf, text="Encode speed:").grid(row=2, column=0, sticky="w", padx=6, pady=3)
+        self._conv_enc_preset_var = tk.StringVar(value="fast")
+        ttk.Combobox(vf, textvariable=self._conv_enc_preset_var, width=W,
+                     state="readonly",
+                     values=["ultrafast", "superfast", "veryfast", "faster",
+                             "fast", "medium", "slow", "slower", "veryslow"]
+                     ).grid(row=2, column=1, padx=6, pady=3, sticky="ew")
+
+        ttk.Label(vf, text="Max resolution:").grid(row=3, column=0, sticky="w", padx=6, pady=3)
+        self._conv_resolution_var = tk.StringVar(value="original")
+        ttk.Combobox(vf, textvariable=self._conv_resolution_var, width=W,
+                     state="readonly",
+                     values=["original", "3840x2160", "1920x1080",
+                             "1280x720", "854x480"]
+                     ).grid(row=3, column=1, padx=6, pady=3, sticky="ew")
+
+        ttk.Label(vf, text="HW acceleration:").grid(row=4, column=0, sticky="w", padx=6, pady=3)
+        self._conv_hwaccel_var = tk.StringVar(value="none")
+        ttk.Combobox(vf, textvariable=self._conv_hwaccel_var, width=W,
+                     state="readonly",
+                     values=["none", "NVIDIA NVENC", "Intel Quick Sync", "AMD AMF"]
+                     ).grid(row=4, column=1, padx=6, pady=3, sticky="ew")
+
+        # -- Audio --
+        af = ttk.LabelFrame(p, text="Audio")
+        af.pack(fill="x", **pad)
+        af.columnconfigure(1, weight=1)
+
+        ttk.Label(af, text="Codec:").grid(row=0, column=0, sticky="w", padx=6, pady=3)
+        self._conv_acodec_var = tk.StringVar(value="copy")
+        ttk.Combobox(af, textvariable=self._conv_acodec_var, width=W,
+                     state="readonly",
+                     values=["copy  (passthrough)", "aac", "ac3", "eac3", "flac"]
+                     ).grid(row=0, column=1, padx=6, pady=3, sticky="ew")
+
+        ttk.Label(af, text="Bitrate:").grid(row=1, column=0, sticky="w", padx=6, pady=3)
+        self._conv_abitrate_var = tk.StringVar(value="320k")
+        ttk.Combobox(af, textvariable=self._conv_abitrate_var, width=W,
+                     state="readonly",
+                     values=["128k", "192k", "256k", "320k"]
+                     ).grid(row=1, column=1, padx=6, pady=3, sticky="ew")
+
+        # -- Subtitles --
+        sf = ttk.LabelFrame(p, text="Subtitles")
+        sf.pack(fill="x", **pad)
+        self._conv_subtitle_var = tk.StringVar(value="copy")
+        for text, val in [("Copy / embed", "copy"),
+                           ("Strip (remove all)", "strip")]:
+            ttk.Radiobutton(sf, text=text,
+                            variable=self._conv_subtitle_var, value=val).pack(
+                anchor="w", padx=8, pady=2)
+
+        # -- Options --
+        optf = ttk.LabelFrame(p, text="Options")
+        optf.pack(fill="x", **pad)
+        self._conv_skip_compat_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(optf, text="Skip already compatible files",
+                        variable=self._conv_skip_compat_var).pack(anchor="w", padx=8, pady=2)
+        self._conv_overwrite_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(optf, text="Overwrite existing output files",
+                        variable=self._conv_overwrite_var).pack(anchor="w", padx=8, pady=2)
+        self._conv_del_orig_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(optf, text="Delete original after success",
+                        variable=self._conv_del_orig_var).pack(anchor="w", padx=8, pady=2)
+
+        # Apply initial preset
+        self._conv_apply_preset()
+
+    def _build_conv_log(self, parent):
+        lf = ttk.LabelFrame(parent, text="Log", padding=(4, 4))
+        lf.grid(row=2, column=0, sticky="ew", padx=6, pady=(0, 6))
+        lf.columnconfigure(0, weight=1)
+
+        self._conv_log_text = tk.Text(
+            lf, height=7, font=("Consolas", 8), state="disabled",
+            wrap="word", relief="flat",
+        )
+        ls = ttk.Scrollbar(lf, orient="vertical", command=self._conv_log_text.yview)
+        self._conv_log_text.configure(yscrollcommand=ls.set)
+        self._conv_log_text.pack(side="left", fill="both", expand=True, padx=(0, 0), pady=2)
+        ls.pack(side="right", fill="y", pady=2, padx=(0, 0))
+
     # ── BMC image loader ──────────────────────────────────────────────────────
 
     def _load_bmc_image(self, height: int = 32):
-        """Load and scale the BMC button PNG.  Returns ImageTk.PhotoImage or None."""
         if not _PIL_OK or not _BMC_IMG.exists():
             return None
         try:
             img = _PILImage.open(_BMC_IMG).convert("RGBA")
-            # Scale to desired height, preserve aspect ratio
-            w = int(img.width * height / img.height)
+            w   = int(img.width * height / img.height)
             img = img.resize((w, height), _PILImage.LANCZOS)
             return _ImageTk.PhotoImage(img)
         except Exception:
             return None
 
-    # ── File helpers ──────────────────────────────────────────────────────────
+    # ── Track Manager: file helpers ───────────────────────────────────────────
 
     def _add_files(self):
         paths = filedialog.askopenfilenames(
@@ -658,26 +1129,24 @@ class App(tk.Tk):
         if p:
             self._log_dir_var.set(p)
 
-    # ── Language helpers ──────────────────────────────────────────────────────
+    # ── Track Manager: language helpers ──────────────────────────────────────
 
     def _add_custom_lang(self):
         raw  = self._custom_lang_entry.get().strip().lower()
-        code = core._normalize_lang(raw)   # normalise to 639-1 where possible
+        code = core._normalize_lang(raw)
         if not code or code in ("und", "mul"):
             messagebox.showwarning("Invalid Code",
                 "Enter a valid ISO 639-1 (2-letter) or 639-2 (3-letter) language code.")
             return
         if code in self._lang_vars:
-            # It's a built-in — just tick it
             self._lang_vars[code].set(True)
-            self._custom_lang_entry.set("") if hasattr(self._custom_lang_entry, "set") else None
+            self._custom_lang_entry.set("")
             messagebox.showinfo("Language Selected",
                 f"'{code}' is already in the list — checkbox ticked.")
             return
         if code not in self._custom_langs:
             self._custom_langs.add(code)
-        self._custom_lang_entry.set("") if hasattr(self._custom_lang_entry, "set") else \
-            self._custom_lang_entry.set("")
+        self._custom_lang_entry.set("")
         self._custom_lang_display.configure(
             text="Custom: " + ", ".join(sorted(self._custom_langs)))
 
@@ -690,7 +1159,7 @@ class App(tk.Tk):
             langs = {"en"}
         return frozenset(langs)
 
-    # ── Audio helpers ─────────────────────────────────────────────────────────
+    # ── Track Manager: audio helpers ──────────────────────────────────────────
 
     def _on_manage_audio_toggle(self):
         state = "normal" if self._manage_audio_var.get() else "disabled"
@@ -721,7 +1190,6 @@ class App(tk.Tk):
             self._audio_lang_lb.delete(i)
 
     def _audio_match_subtitles(self):
-        """Copy the current subtitle language selection into the audio list."""
         langs = sorted(code for code, var in self._lang_vars.items() if var.get())
         langs += sorted(self._custom_langs)
         self._audio_lang_lb.delete(0, "end")
@@ -729,24 +1197,21 @@ class App(tk.Tk):
             self._audio_lang_lb.insert("end", lang)
 
     def _update_sub_primary_options(self):
-        """Populate the subtitle primary combobox with currently-selected languages."""
-        langs = sorted(code for code, var in self._lang_vars.items() if var.get())
-        langs += sorted(self._custom_langs)
+        langs   = sorted(code for code, var in self._lang_vars.items() if var.get())
+        langs  += sorted(self._custom_langs)
         options = ["(auto)"] + langs
         self._sub_primary_cb["values"] = options
         if self._sub_primary_var.get() not in options:
             self._sub_primary_var.set("(auto)")
 
     def _update_audio_primary_options(self):
-        """Populate the audio primary combobox with currently-listed audio languages."""
-        langs = list(self._audio_lang_lb.get(0, "end"))
+        langs   = list(self._audio_lang_lb.get(0, "end"))
         options = ["(auto)"] + langs
         self._audio_primary_cb["values"] = options
         if self._audio_primary_var.get() not in options:
             self._audio_primary_var.set("(auto)")
 
     def _get_audio_langs(self) -> frozenset[str] | None:
-        """Return frozenset of audio languages, or None if manage_audio is off."""
         if not self._manage_audio_var.get():
             return None
         langs = list(self._audio_lang_lb.get(0, "end"))
@@ -754,7 +1219,7 @@ class App(tk.Tk):
             return frozenset({"en"})
         return frozenset(langs)
 
-    # ── Remap helpers ─────────────────────────────────────────────────────────
+    # ── Track Manager: remap helpers ─────────────────────────────────────────
 
     def _add_remap(self):
         frm = self._remap_from.get().strip().lower()
@@ -780,7 +1245,7 @@ class App(tk.Tk):
                 result[old.strip()] = new.strip()
         return result
 
-    # ── Output helpers ────────────────────────────────────────────────────────
+    # ── Track Manager: output helpers ────────────────────────────────────────
 
     def _append_output(self, text: str):
         self._output_txt.configure(state="normal")
@@ -794,14 +1259,16 @@ class App(tk.Tk):
         self._output_txt.delete("1.0", "end")
         self._output_txt.configure(state="disabled")
 
+    # ── Unified output poll (Track Manager + Converter) ───────────────────────
+
     def _poll_output(self):
-        """Drain the queue into the text widget — called every 100 ms on the main thread."""
+        # --- Track Manager queue ---
         try:
             while True:
                 line = self._output_q.get_nowait()
-                # Count processed files for progress bar
                 stripped = line.strip()
-                if stripped.startswith("Processing:") or stripped.startswith("[DRY RUN] Processing:"):
+                if stripped.startswith("Processing:") or \
+                        stripped.startswith("[DRY RUN] Processing:"):
                     self._done += 1
                     if self._total:
                         pct = int(100 * self._done / self._total)
@@ -812,9 +1279,21 @@ class App(tk.Tk):
                 self._append_output(line)
         except queue.Empty:
             pass
+
+        # --- Video Converter log queue ---
+        try:
+            while True:
+                msg = self._conv_log_q.get_nowait()
+                self._conv_log_text.configure(state="normal")
+                self._conv_log_text.insert("end", msg + "\n")
+                self._conv_log_text.see("end")
+                self._conv_log_text.configure(state="disabled")
+        except queue.Empty:
+            pass
+
         self.after(100, self._poll_output)
 
-    # ── Processing control ────────────────────────────────────────────────────
+    # ── Track Manager: processing control ────────────────────────────────────
 
     def _start(self):
         paths = list(self._path_lb.get(0, "end"))
@@ -834,14 +1313,12 @@ class App(tk.Tk):
         log_dir            = self._log_dir_var.get()
         _sp = self._sub_primary_var.get()
         _ap = self._audio_primary_var.get()
-        preferred_sub_lang   = None if _sp  == "(auto)" else _sp
-        preferred_audio_lang = None if _ap  == "(auto)" else _ap
+        preferred_sub_lang   = None if _sp == "(auto)" else _sp
+        preferred_audio_lang = None if _ap == "(auto)" else _ap
 
-        # Reset core events
         core._pause_event.set()
         core._stop_event.clear()
 
-        # Reset progress
         self._done  = 0
         self._total = 0
         self._progress["value"] = 0
@@ -849,7 +1326,6 @@ class App(tk.Tk):
         self._status_lbl.configure(text="Starting…")
         self._paused = False
 
-        # Update button states
         self._start_btn.configure(state="disabled")
         self._pause_btn.configure(state="normal", text="  Pause")
         self._stop_btn.configure(state="normal")
@@ -865,13 +1341,11 @@ class App(tk.Tk):
 
     def _toggle_pause(self):
         if self._paused:
-            # Resume
             core._pause_event.set()
             self._paused = False
             self._pause_btn.configure(text="  Pause")
             self._status_lbl.configure(text="Resuming…")
         else:
-            # Pause (takes effect after the current file finishes)
             core._pause_event.clear()
             self._paused = True
             self._pause_btn.configure(text="  Resume")
@@ -879,11 +1353,10 @@ class App(tk.Tk):
 
     def _stop(self):
         core._stop_event.set()
-        core._pause_event.set()   # unblock if currently paused
+        core._pause_event.set()
         self._status_lbl.configure(text="Stopping after current file…")
 
     def _on_done(self):
-        """Called on the main thread when the worker finishes."""
         self._start_btn.configure(state="normal")
         self._pause_btn.configure(state="disabled", text="  Pause")
         self._stop_btn.configure(state="disabled")
@@ -894,18 +1367,16 @@ class App(tk.Tk):
             text="Stopped." if stopped else
             f"Done.  {self._done}/{self._total} files")
 
-    # ── Worker thread ─────────────────────────────────────────────────────────
+    # ── Track Manager: worker thread ──────────────────────────────────────────
 
     def _worker_func(self, paths, keep_langs, remaps, dry_run, recursive, no_log,
                      spell_check, manage_audio, audio_langs, log_dir,
                      preferred_sub_lang=None, preferred_audio_lang=None):
-        # Configure logging
         if no_log:
             core._LOG_DIR = None
         else:
             core._LOG_DIR = Path(log_dir)
 
-        # Collect MKV files
         mkv_files: list[Path] = []
         for raw in paths:
             p = Path(raw)
@@ -960,6 +1431,400 @@ class App(tk.Tk):
         )
 
         self.after(0, self._on_done)
+
+    # ── Video Converter: preset logic ────────────────────────────────────────
+
+    def _conv_apply_preset(self, event=None):
+        name = self._conv_preset_var.get()
+        p    = PRESETS.get(name, PRESETS["Custom"])
+        self._conv_preset_desc_lbl.config(text=p["desc"])
+
+        if name == "Custom":
+            return
+
+        self._conv_container_var.set(p["container"])
+
+        vmap = {"libx264": "libx264  (H.264)",
+                "libx265": "libx265  (H.265/HEVC)",
+                "copy":    "copy  (no re-encode)"}
+        self._conv_vcodec_var.set(vmap.get(p["vcodec"], p["vcodec"]))
+
+        self._conv_crf_var.set(p["crf"])
+        self._conv_crf_lbl.config(text=str(p["crf"]))
+        self._conv_enc_preset_var.set(p["preset"])
+        self._conv_resolution_var.set(p["resolution"])
+
+        amap = {"copy": "copy  (passthrough)", "aac": "aac",
+                "ac3": "ac3", "eac3": "eac3", "flac": "flac"}
+        self._conv_acodec_var.set(amap.get(p["acodec"], p["acodec"]))
+
+        self._conv_abitrate_var.set(p["abitrate"])
+        self._conv_subtitle_var.set(p["subtitle"])
+        self._conv_skip_compat_var.set(p["skip_compatible"])
+
+    def _conv_normalise_vcodec(self, event=None):
+        v = self._conv_vcodec_var.get().split("  ")[0]
+        self._conv_vcodec_var.set(v)
+
+    # ── Video Converter: file management ─────────────────────────────────────
+
+    def _conv_add_files(self):
+        exts_str = " ".join(f"*{e}" for e in sorted(VIDEO_EXTENSIONS))
+        paths = filedialog.askopenfilenames(
+            title="Select video file(s)",
+            filetypes=[("Video files", exts_str), ("All files", "*.*")],
+        )
+        for p in paths:
+            self._conv_add_path(Path(p))
+
+    def _conv_add_folder(self):
+        folder = filedialog.askdirectory(title="Select folder containing videos")
+        if not folder:
+            return
+        added = 0
+        for p in Path(folder).rglob("*"):
+            if p.is_file() and p.suffix.lower() in VIDEO_EXTENSIONS:
+                self._conv_add_path(p)
+                added += 1
+        self._conv_log(f"Scanned folder — {added} file(s) added: {folder}")
+
+    def _conv_add_path(self, path: Path):
+        if path.suffix.lower() not in VIDEO_EXTENSIONS:
+            return
+        if any(f.path == path for f in self._conv_files):
+            return
+
+        info    = FileInfo(path=path, size_mb=path.stat().st_size / 1_048_576)
+        row_id  = self._conv_tree.insert("", "end", tags=("pending",), values=(
+            path.name, "…", "…", "…",
+            f"{info.size_mb:.1f} MB", "Pending", "",
+        ))
+        info.row_id = row_id
+        self._conv_files.append(info)
+
+        threading.Thread(
+            target=self._conv_probe_file, args=(info,), daemon=True).start()
+
+    def _conv_remove_selected(self):
+        for item in self._conv_tree.selection():
+            self._conv_tree.delete(item)
+            self._conv_files = [f for f in self._conv_files if f.row_id != item]
+
+    def _conv_clear_all(self):
+        self._conv_tree.delete(*self._conv_tree.get_children())
+        self._conv_files.clear()
+
+    def _conv_browse_output(self):
+        d = filedialog.askdirectory(title="Choose output directory")
+        if d:
+            self._conv_output_var.set(d)
+
+    def _conv_sort_tree(self, col: str):
+        items = [(self._conv_tree.set(k, col), k)
+                 for k in self._conv_tree.get_children("")]
+        items.sort(key=lambda t: t[0].lower())
+        for idx, (_, k) in enumerate(items):
+            self._conv_tree.move(k, "", idx)
+
+    # ── Video Converter: ffprobe ──────────────────────────────────────────────
+
+    def _conv_probe_file(self, info: FileInfo):
+        if not self._ffprobe:
+            return
+        with self._conv_probe_sem:
+            self._conv_do_probe(info)
+
+    def _conv_do_probe(self, info: FileInfo):
+        try:
+            result = subprocess.run(
+                [self._ffprobe, "-v", "quiet", "-print_format", "json",
+                 "-show_streams", "-show_format", str(info.path)],
+                capture_output=True, text=True, timeout=30,
+            )
+            if not result.stdout:
+                self._conv_log(f"Probe warning — no output for: {info.path.name}")
+                return
+            data = json.loads(result.stdout)
+
+            for stream in data.get("streams", []):
+                ct = stream.get("codec_type", "")
+                if ct == "video" and info.video_codec == "—":
+                    info.video_codec = stream.get("codec_name", "?")
+                    w = stream.get("width",  0)
+                    h = stream.get("height", 0)
+                    info.resolution  = f"{w}×{h}" if w else "?"
+                elif ct == "audio" and info.audio_codec == "—":
+                    info.audio_codec = stream.get("codec_name", "?")
+
+            fmt           = data.get("format", {})
+            info.duration = float(fmt.get("duration", 0))
+            self.after(0, self._conv_refresh_row, info)
+        except json.JSONDecodeError as e:
+            self._conv_log(f"Probe error (bad JSON) — {info.path.name}: {e}")
+        except Exception as e:
+            self._conv_log(f"Probe error — {info.path.name}: {e}")
+
+    # ── Video Converter: tree row update ──────────────────────────────────────
+
+    def _conv_refresh_row(self, info: FileInfo, prog_text: str = ""):
+        if not info.row_id or not self._conv_tree.exists(info.row_id):
+            return
+        tag   = info.status.lower()
+        ptext = prog_text or (
+            "" if info.status in ("Pending", "Converting") else info.status)
+        self._conv_tree.item(info.row_id,
+                             tags=(tag,),
+                             values=(
+                                 info.path.name,
+                                 info.resolution,
+                                 info.video_codec,
+                                 info.audio_codec,
+                                 f"{info.size_mb:.1f} MB",
+                                 info.status,
+                                 ptext,
+                             ))
+
+    # ── Video Converter: log helper ───────────────────────────────────────────
+
+    def _conv_log(self, msg: str):
+        self._conv_log_q.put(msg)
+
+    # ── Video Converter: conversion control ───────────────────────────────────
+
+    def _conv_start(self):
+        if not self._ffmpeg:
+            messagebox.showerror(
+                "ffmpeg not found",
+                "ffmpeg.exe was not found on PATH or in C:\\ffmpeg\\bin.\n\n"
+                "Download from https://ffmpeg.org/download.html\n"
+                "and add the bin\\ folder to your system PATH.",
+            )
+            return
+
+        pending = [f for f in self._conv_files if f.status in ("Pending", "Error")]
+        if not pending:
+            messagebox.showinfo("Nothing to do", "No pending files to convert.")
+            return
+
+        self._conv_converting = True
+        self._conv_stop_flag.clear()
+        self._conv_start_btn.configure(state="disabled")
+        self._conv_stop_btn.configure(state="normal")
+        threading.Thread(
+            target=self._conv_worker, args=(pending,), daemon=True).start()
+
+    def _conv_stop(self):
+        self._conv_stop_flag.set()
+        if self._conv_current_proc:
+            try:
+                self._conv_current_proc.terminate()
+            except Exception:
+                pass
+        self._conv_log("Stop requested — finishing current file…")
+        self._conv_stop_btn.configure(state="disabled")
+
+    def _conv_on_done(self):
+        self._conv_converting = False
+        self._conv_start_btn.configure(state="normal")
+        self._conv_stop_btn.configure(state="disabled")
+
+    def _conv_set_overall(self, done: int, total: int):
+        self._conv_overall_bar["value"] = done / total * 100 if total else 0
+        self._conv_overall_lbl["text"]  = f"{done} / {total}"
+
+    # ── Video Converter: worker thread ────────────────────────────────────────
+
+    def _conv_worker(self, files: List[FileInfo]):
+        total = len(files)
+        done  = 0
+        time_re = re.compile(r"time=(\d+):(\d+):(\d+)\.(\d+)")
+
+        for info in files:
+            if self._conv_stop_flag.is_set():
+                info.status = "Cancelled"
+                self.after(0, self._conv_refresh_row, info)
+                continue
+
+            # Skip compatible?
+            if self._conv_skip_compat_var.get() and info.is_plex_compatible:
+                info.status = "Skipped"
+                self._conv_log(f"[skip] {info.path.name}  (already compatible)")
+                self.after(0, self._conv_refresh_row, info)
+                done += 1
+                self.after(0, self._conv_set_overall, done, total)
+                continue
+
+            output = self._conv_output_path(info)
+
+            if output.exists() and not self._conv_overwrite_var.get():
+                info.status = "Skipped"
+                self._conv_log(f"[skip] {info.path.name}  (output exists)")
+                self.after(0, self._conv_refresh_row, info)
+                done += 1
+                self.after(0, self._conv_set_overall, done, total)
+                continue
+
+            cmd = self._conv_build_cmd(info, output)
+            self._conv_log(f"\n[start] {info.path.name}")
+            self._conv_log(f"    →   {output}")
+
+            info.status = "Converting"
+            self.after(0, self._conv_refresh_row, info)
+
+            try:
+                self._conv_current_proc = subprocess.Popen(
+                    cmd,
+                    stderr=subprocess.PIPE,
+                    universal_newlines=True,
+                    encoding="utf-8",
+                    errors="replace",
+                )
+
+                for line in self._conv_current_proc.stderr:
+                    if self._conv_stop_flag.is_set():
+                        self._conv_current_proc.terminate()
+                        break
+                    m = time_re.search(line)
+                    if m and info.duration > 0:
+                        h, mn, s, cs = (int(m.group(i)) for i in range(1, 5))
+                        elapsed = h * 3600 + mn * 60 + s + cs / 100
+                        pct     = min(100.0, elapsed / info.duration * 100)
+                        info.progress = pct
+                        self.after(0, self._conv_refresh_row, info, f"{pct:.0f}%")
+                    elif "error" in line.lower() and "nonfatal" not in line.lower():
+                        self._conv_log(f"    ! {line.rstrip()}")
+
+                ret = self._conv_current_proc.wait()
+                self._conv_current_proc = None
+
+                if ret == 0 and not self._conv_stop_flag.is_set():
+                    info.status = "Done"
+                    out_mb = output.stat().st_size / 1_048_576 if output.exists() else 0
+                    ratio  = out_mb / info.size_mb * 100 if info.size_mb else 0
+                    self._conv_log(
+                        f"[done] {info.path.name}  "
+                        f"{info.size_mb:.0f} MB → {out_mb:.0f} MB  ({ratio:.0f}%)")
+
+                    if self._conv_del_orig_var.get() and output.exists():
+                        info.path.unlink()
+                        self._conv_log("  [del] original removed")
+                else:
+                    info.status = "Cancelled" if self._conv_stop_flag.is_set() else "Error"
+                    self._conv_log(f"[fail] {info.path.name}  exit={ret}")
+                    if output.exists():
+                        output.unlink()
+
+            except Exception as exc:
+                info.status = "Error"
+                self._conv_log(f"[err]  {info.path.name}: {exc}")
+                self._conv_current_proc = None
+
+            done += 1
+            self.after(0, self._conv_refresh_row, info,
+                       "100%" if info.status == "Done" else "")
+            self.after(0, self._conv_set_overall, done, total)
+
+        counts = {s: sum(1 for f in files if f.status == s)
+                  for s in ("Done", "Skipped", "Error", "Cancelled")}
+        self._conv_log(
+            f"\n── Finished ──────────────────────────────────────────\n"
+            f"   Done: {counts['Done']}  Skipped: {counts['Skipped']}  "
+            f"Error: {counts['Error']}  Cancelled: {counts['Cancelled']}"
+        )
+        self.after(0, self._conv_on_done)
+
+    # ── Video Converter: ffmpeg command builder ───────────────────────────────
+
+    def _conv_output_path(self, info: FileInfo) -> Path:
+        ext     = self._conv_container_var.get()
+        out_s   = self._conv_output_var.get()
+        out_dir = info.path.parent if out_s == "Same as source" else Path(out_s)
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        stem = info.path.stem
+        if info.path.parent == out_dir:
+            stem += "_plex"
+        return out_dir / f"{stem}.{ext}"
+
+    def _conv_build_cmd(self, info: FileInfo, output: Path) -> List[str]:
+        cmd: List[str] = [self._ffmpeg, "-hide_banner", "-loglevel", "info"]
+
+        # Hardware-accelerated decode
+        hw = self._conv_hwaccel_var.get()
+        if "NVIDIA" in hw:
+            cmd += ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]
+        elif "Intel" in hw:
+            cmd += ["-hwaccel", "qsv"]
+        elif "AMD" in hw:
+            cmd += ["-hwaccel", "d3d11va"]
+
+        cmd += ["-i", str(info.path)]
+        cmd += ["-y" if self._conv_overwrite_var.get() else "-n"]
+
+        # Video codec
+        raw_vc      = self._conv_vcodec_var.get().split("  ")[0]
+        final_vcodec = raw_vc
+
+        if raw_vc == "copy":
+            cmd += ["-c:v", "copy"]
+        else:
+            hw_enc_map = {
+                "NVIDIA NVENC":    {"libx264": "h264_nvenc",  "libx265": "hevc_nvenc"},
+                "Intel Quick Sync":{"libx264": "h264_qsv",    "libx265": "hevc_qsv"},
+                "AMD AMF":         {"libx264": "h264_amf",    "libx265": "hevc_amf"},
+            }
+            final_vcodec = hw_enc_map.get(hw, {}).get(raw_vc, raw_vc)
+            cmd += ["-c:v", final_vcodec]
+
+            crf = str(self._conv_crf_var.get())
+            spd = self._conv_enc_preset_var.get()
+            if final_vcodec in ("libx264", "libx265"):
+                cmd += ["-crf", crf, "-preset", spd]
+            elif "nvenc" in final_vcodec:
+                cmd += ["-rc", "vbr", "-cq", crf, "-preset", "p4"]
+            elif "qsv" in final_vcodec:
+                cmd += ["-global_quality", crf, "-preset", "medium"]
+            elif "amf" in final_vcodec:
+                cmd += ["-rc", "cqp", "-qp_i", crf, "-qp_p", crf]
+
+        is_hevc = final_vcodec in ("libx265", "hevc_nvenc", "hevc_qsv", "hevc_amf")
+
+        # Resolution downscale / H.265 even-dimension enforcement
+        res = self._conv_resolution_var.get()
+        if res != "original":
+            w, h = res.split("x")
+            vf   = (f"scale={w}:{h}:force_original_aspect_ratio=decrease"
+                    ":flags=lanczos,pad=ceil(iw/2)*2:ceil(ih/2)*2")
+            cmd += ["-vf", vf]
+        elif is_hevc:
+            cmd += ["-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2"]
+
+        # Audio codec
+        raw_ac = self._conv_acodec_var.get().split("  ")[0]
+        if raw_ac == "copy":
+            cmd += ["-c:a", "copy"]
+        else:
+            cmd += ["-c:a", raw_ac, "-b:a", self._conv_abitrate_var.get()]
+
+        # Subtitles
+        if self._conv_subtitle_var.get() == "strip":
+            cmd += ["-sn"]
+        else:
+            container = self._conv_container_var.get()
+            if container == "mp4":
+                cmd += ["-c:s", "mov_text"]
+            else:
+                cmd += ["-c:s", "copy"]
+
+        # Map primary video, all audio, optional subtitles — skip embedded cover art
+        cmd += ["-map", "0:v:0", "-map", "0:a?", "-map", "0:s?"]
+
+        # MP4 streaming optimisation
+        if self._conv_container_var.get() == "mp4":
+            cmd += ["-movflags", "+faststart"]
+
+        cmd.append(str(output))
+        return cmd
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
