@@ -276,13 +276,15 @@ class App(tk.Tk):
         self._ffprobe = self._find_exe("ffprobe")
         self._conv_probe_sem = threading.Semaphore(4)
 
-        # Load saved preference (default: dark mode on)
+        # Load saved preferences
         prefs = self._load_prefs()
         self._dark_mode = tk.BooleanVar(value=prefs.get("dark_mode", True))
 
         self._build_ui()
+        self._restore_prefs(prefs)   # re-apply saved widget states
         self._apply_theme()
         self._poll_output()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
 
     # ── Preference persistence ────────────────────────────────────────────────
 
@@ -296,13 +298,125 @@ class App(tk.Tk):
 
     def _save_prefs(self):
         try:
-            prefs = self._load_prefs()
-            prefs["dark_mode"] = self._dark_mode.get()
-            _CONFIG.write_text(
-                json.dumps(prefs, indent=2), encoding="utf-8"
-            )
+            prefs: dict = {"dark_mode": self._dark_mode.get()}
+
+            # ── Track Manager ─────────────────────────────────────────────
+            if hasattr(self, "_recursive_var"):
+                prefs.update({
+                    "tm_recursive":      self._recursive_var.get(),
+                    "tm_dry_run":        self._dry_run_var.get(),
+                    "tm_no_log":         self._no_log_var.get(),
+                    "tm_spell_check":    self._spell_check_var.get(),
+                    "tm_manage_audio":   self._manage_audio_var.get(),
+                    "tm_keep_langs":     [c for c, v in self._lang_vars.items() if v.get()],
+                    "tm_custom_langs":   sorted(self._custom_langs),
+                    "tm_audio_langs":    list(self._audio_lang_lb.get(0, "end")),
+                    "tm_log_dir":        self._log_dir_var.get(),
+                    "tm_remaps":         list(self._remap_lb.get(0, "end")),
+                    "tm_sub_primary":    self._sub_primary_var.get(),
+                    "tm_audio_primary":  self._audio_primary_var.get(),
+                })
+
+            # ── Video Converter ───────────────────────────────────────────
+            if hasattr(self, "_conv_preset_var"):
+                prefs.update({
+                    "conv_preset":       self._conv_preset_var.get(),
+                    "conv_output_dir":   self._conv_output_var.get(),
+                    "conv_container":    self._conv_container_var.get(),
+                    "conv_vcodec":       self._conv_vcodec_var.get(),
+                    "conv_crf":          self._conv_crf_var.get(),
+                    "conv_enc_preset":   self._conv_enc_preset_var.get(),
+                    "conv_resolution":   self._conv_resolution_var.get(),
+                    "conv_hwaccel":      self._conv_hwaccel_var.get(),
+                    "conv_acodec":       self._conv_acodec_var.get(),
+                    "conv_abitrate":     self._conv_abitrate_var.get(),
+                    "conv_subtitle":     self._conv_subtitle_var.get(),
+                    "conv_skip_compat":  self._conv_skip_compat_var.get(),
+                    "conv_overwrite":    self._conv_overwrite_var.get(),
+                    "conv_del_orig":     self._conv_del_orig_var.get(),
+                    "conv_replace_orig": self._conv_replace_orig_var.get(),
+                })
+
+            _CONFIG.write_text(json.dumps(prefs, indent=2), encoding="utf-8")
         except Exception:
             pass
+
+    def _restore_prefs(self, prefs: dict):
+        """Apply saved settings to all widgets after _build_ui() completes."""
+        if not prefs:
+            return
+
+        # ── Track Manager ─────────────────────────────────────────────────
+        self._recursive_var.set(  prefs.get("tm_recursive",    True))
+        self._dry_run_var.set(    prefs.get("tm_dry_run",       False))
+        self._no_log_var.set(     prefs.get("tm_no_log",        False))
+        self._spell_check_var.set(prefs.get("tm_spell_check",   False))
+        self._manage_audio_var.set(prefs.get("tm_manage_audio", False))
+
+        # Language checkboxes
+        keep = set(prefs.get("tm_keep_langs", ["en"]))
+        for code, var in self._lang_vars.items():
+            var.set(code in keep)
+
+        # Custom language codes
+        for code in prefs.get("tm_custom_langs", []):
+            self._custom_langs.add(code)
+        if self._custom_langs:
+            self._custom_lang_display.configure(
+                text="Custom: " + ", ".join(sorted(self._custom_langs)))
+
+        # Audio language listbox
+        self._audio_lang_lb.delete(0, "end")
+        for lang in prefs.get("tm_audio_langs", ["en"]):
+            self._audio_lang_lb.insert("end", lang)
+
+        # Language remap listbox
+        self._remap_lb.delete(0, "end")
+        for entry in prefs.get("tm_remaps", []):
+            self._remap_lb.insert("end", entry)
+
+        # Log directory
+        self._log_dir_var.set(prefs.get("tm_log_dir", str(core._LOG_DIR_DEFAULT)))
+
+        # Primary language selectors
+        self._sub_primary_var.set(  prefs.get("tm_sub_primary",   "(auto)"))
+        self._audio_primary_var.set(prefs.get("tm_audio_primary", "(auto)"))
+
+        # Refresh disabled state of audio options sub-panel
+        self._on_manage_audio_toggle()
+
+        # ── Video Converter ───────────────────────────────────────────────
+        if "conv_preset" not in prefs:
+            return
+
+        self._conv_preset_var.set(    prefs.get("conv_preset",     "Shield Optimal"))
+        self._conv_output_var.set(    prefs.get("conv_output_dir", "Same as source"))
+        self._conv_container_var.set( prefs.get("conv_container",  "mkv"))
+        self._conv_vcodec_var.set(    prefs.get("conv_vcodec",     "libx265"))
+
+        crf = prefs.get("conv_crf", 20)
+        self._conv_crf_var.set(crf)
+        self._conv_crf_lbl.config(text=str(crf))
+
+        self._conv_enc_preset_var.set( prefs.get("conv_enc_preset",  "fast"))
+        self._conv_resolution_var.set( prefs.get("conv_resolution",  "original"))
+        self._conv_hwaccel_var.set(    prefs.get("conv_hwaccel",     "none"))
+        self._conv_acodec_var.set(     prefs.get("conv_acodec",      "copy"))
+        self._conv_abitrate_var.set(   prefs.get("conv_abitrate",    "320k"))
+        self._conv_subtitle_var.set(   prefs.get("conv_subtitle",    "copy"))
+        self._conv_skip_compat_var.set( prefs.get("conv_skip_compat", True))
+        self._conv_overwrite_var.set(  prefs.get("conv_overwrite",   False))
+        self._conv_del_orig_var.set(   prefs.get("conv_del_orig",    False))
+        self._conv_replace_orig_var.set(prefs.get("conv_replace_orig", False))
+
+        # Update preset description label
+        p = PRESETS.get(prefs.get("conv_preset", "Shield Optimal"), PRESETS["Custom"])
+        self._conv_preset_desc_lbl.config(text=p["desc"])
+
+    def _on_close(self):
+        """Save all settings then close the window."""
+        self._save_prefs()
+        self.destroy()
 
     # ── ffmpeg / ffprobe discovery ────────────────────────────────────────────
 
