@@ -40,6 +40,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 import tkinter as tk
 import webbrowser
 from dataclasses import dataclass
@@ -862,6 +863,12 @@ class App(tk.Tk):
         )
         self._conv_start_btn.pack(side="right", padx=(0, 6))
 
+        self._conv_combined_btn = ttk.Button(
+            bar, text="▶ Combined Run",
+            command=self._combined_start_conv,
+        )
+        self._conv_combined_btn.pack(side="right", padx=(0, 6))
+
     def _build_conv_paned(self, parent):
         pw = ttk.PanedWindow(parent, orient="horizontal")
         pw.grid(row=1, column=0, sticky="nsew", padx=6, pady=(0, 4))
@@ -1072,6 +1079,9 @@ class App(tk.Tk):
         self._conv_del_orig_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(optf, text="Delete original after success",
                         variable=self._conv_del_orig_var).pack(anchor="w", padx=8, pady=2)
+        self._conv_replace_orig_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(optf, text="Replace original (delete + rename, removes _plex)",
+                        variable=self._conv_replace_orig_var).pack(anchor="w", padx=8, pady=2)
 
         # Apply initial preset
         self._conv_apply_preset()
@@ -1334,6 +1344,7 @@ class App(tk.Tk):
         self._stop_btn.configure(state="normal")
         self._combined_btn.configure(state="disabled")
         self._conv_start_btn.configure(state="disabled")
+        self._conv_combined_btn.configure(state="disabled")
 
         self._worker = threading.Thread(
             target=self._worker_func,
@@ -1367,6 +1378,7 @@ class App(tk.Tk):
         self._stop_btn.configure(state="disabled")
         self._combined_btn.configure(state="normal")
         self._conv_start_btn.configure(state="normal")
+        self._conv_combined_btn.configure(state="normal")
         self._progress["value"] = 100
         self._pct_lbl.configure(text="100%")
         stopped = core._stop_event.is_set()
@@ -1621,6 +1633,37 @@ class App(tk.Tk):
                                  ptext,
                              ))
 
+    # ── Video Converter: replace-original helper ──────────────────────────────
+
+    def _conv_do_replace_original(self, info: FileInfo, output: Path) -> Path:
+        """Delete the original file and rename the output to the original stem
+        (keeping the new extension).  Returns the final path.
+
+        e.g.  Movie.mkv  +  Movie_plex.mp4  →  Movie.mp4
+        """
+        final = output.parent / f"{info.path.stem}{output.suffix}"
+        # Delete original
+        try:
+            info.path.unlink()
+            self._conv_log(f"  [del] original removed: {info.path.name}")
+        except Exception as e:
+            self._conv_log(f"  [warn] could not delete original: {e}")
+            return output
+        # Rename with retry (Plex may briefly hold the file)
+        for attempt in range(6):
+            try:
+                output.rename(final)
+                self._conv_log(f"  [renamed] {output.name}  →  {final.name}")
+                return final
+            except OSError as e:
+                if attempt < 5:
+                    self._conv_log(
+                        f"  [retry {attempt + 1}/5] rename locked — waiting 5 s…")
+                    time.sleep(5)
+                else:
+                    self._conv_log(f"  [err] rename failed after retries: {e}")
+        return output
+
     # ── Video Converter: log helper ───────────────────────────────────────────
 
     def _conv_log(self, msg: str):
@@ -1648,6 +1691,7 @@ class App(tk.Tk):
         self._conv_start_btn.configure(state="disabled")
         self._conv_stop_btn.configure(state="normal")
         self._combined_btn.configure(state="disabled")
+        self._conv_combined_btn.configure(state="disabled")
         self._start_btn.configure(state="disabled")
         threading.Thread(
             target=self._conv_worker, args=(pending,), daemon=True).start()
@@ -1667,6 +1711,7 @@ class App(tk.Tk):
         self._conv_start_btn.configure(state="normal")
         self._conv_stop_btn.configure(state="disabled")
         self._combined_btn.configure(state="normal")
+        self._conv_combined_btn.configure(state="normal")
         self._start_btn.configure(state="normal")
 
     def _conv_set_overall(self, done: int, total: int):
@@ -1746,7 +1791,9 @@ class App(tk.Tk):
                         f"[done] {info.path.name}  "
                         f"{info.size_mb:.0f} MB → {out_mb:.0f} MB  ({ratio:.0f}%)")
 
-                    if self._conv_del_orig_var.get() and output.exists():
+                    if self._conv_replace_orig_var.get() and output.exists():
+                        output = self._conv_do_replace_original(info, output)
+                    elif self._conv_del_orig_var.get() and output.exists():
                         info.path.unlink()
                         self._conv_log("  [del] original removed")
                 else:
@@ -1916,6 +1963,7 @@ class App(tk.Tk):
         self._pause_btn.configure(state="disabled")
         self._stop_btn.configure(state="normal")
         self._combined_btn.configure(state="disabled")
+        self._conv_combined_btn.configure(state="disabled")
         self._conv_start_btn.configure(state="disabled")
         self._conv_stop_btn.configure(state="disabled")
 
@@ -1933,6 +1981,7 @@ class App(tk.Tk):
         self._pause_btn.configure(state="disabled", text="  Pause")
         self._stop_btn.configure(state="disabled")
         self._combined_btn.configure(state="normal")
+        self._conv_combined_btn.configure(state="normal")
         self._conv_start_btn.configure(state="normal")
         self._conv_stop_btn.configure(state="disabled")
         self._progress["value"] = 100
@@ -2063,7 +2112,9 @@ class App(tk.Tk):
                             f"[done] {f.name}  "
                             f"{info.size_mb:.0f} MB → {out_mb:.0f} MB  ({ratio:.0f}%)")
                         converted += 1
-                        if self._conv_del_orig_var.get() and output.exists():
+                        if self._conv_replace_orig_var.get() and output.exists():
+                            self._conv_do_replace_original(info, output)
+                        elif self._conv_del_orig_var.get() and output.exists():
                             f.unlink()
                             self._conv_log("  [del] original removed")
                     else:
@@ -2088,6 +2139,234 @@ class App(tk.Tk):
             f"  Errors                : {errors}\n"
         )
         self.after(0, self._combined_on_done)
+
+    # ── Combined Run from Converter tab ───────────────────────────────────────
+
+    def _combined_start_conv(self):
+        """Combined Run initiated from the Video Converter tab.
+        Uses the Converter treeview file list + TM settings from Tab 1."""
+        pending = [f for f in self._conv_files if f.status in ("Pending", "Error")]
+        if not pending:
+            messagebox.showinfo("Nothing to do",
+                "No pending files in the Video Converter list.")
+            return
+
+        if not self._ffmpeg:
+            messagebox.showerror(
+                "ffmpeg not found",
+                "Combined mode requires ffmpeg.\n\n"
+                "ffmpeg.exe was not found on PATH or in C:\\ffmpeg\\bin.\n"
+                "Download from https://ffmpeg.org/download.html",
+            )
+            return
+
+        # Collect Track Manager settings from Tab 1
+        keep_langs         = self._get_keep_langs()
+        remaps             = self._get_remaps()
+        dry_run            = self._dry_run_var.get()
+        no_log             = self._no_log_var.get()
+        spell_check        = self._spell_check_var.get()
+        manage_audio       = self._manage_audio_var.get()
+        audio_langs        = self._get_audio_langs()
+        log_dir            = self._log_dir_var.get()
+        _sp = self._sub_primary_var.get()
+        _ap = self._audio_primary_var.get()
+        preferred_sub_lang   = None if _sp == "(auto)" else _sp
+        preferred_audio_lang = None if _ap == "(auto)" else _ap
+
+        core._pause_event.set()
+        core._stop_event.clear()
+        self._conv_stop_flag.clear()
+
+        self._start_btn.configure(state="disabled")
+        self._pause_btn.configure(state="disabled")
+        self._stop_btn.configure(state="disabled")        # no TM stop for this mode
+        self._combined_btn.configure(state="disabled")
+        self._conv_start_btn.configure(state="disabled")
+        self._conv_stop_btn.configure(state="normal")     # conv Stop halts ffmpeg
+        self._conv_combined_btn.configure(state="disabled")
+
+        threading.Thread(
+            target=self._combined_worker_conv,
+            args=(pending, keep_langs, remaps, dry_run, no_log,
+                  spell_check, manage_audio, audio_langs, log_dir,
+                  preferred_sub_lang, preferred_audio_lang),
+            daemon=True,
+        ).start()
+
+    def _combined_on_done_conv(self):
+        self._start_btn.configure(state="normal")
+        self._pause_btn.configure(state="disabled", text="  Pause")
+        self._stop_btn.configure(state="disabled")
+        self._combined_btn.configure(state="normal")
+        self._conv_start_btn.configure(state="normal")
+        self._conv_stop_btn.configure(state="disabled")
+        self._conv_combined_btn.configure(state="normal")
+        self._conv_converting = False
+
+    def _combined_worker_conv(self, files: List[FileInfo],
+                               keep_langs, remaps, dry_run, no_log,
+                               spell_check, manage_audio, audio_langs, log_dir,
+                               preferred_sub_lang=None, preferred_audio_lang=None):
+        """Combined pipeline from the Converter tab: TM (MKV only) → ffmpeg.
+        Updates the Converter treeview rows throughout."""
+        if no_log:
+            core._LOG_DIR = None
+        else:
+            core._LOG_DIR = Path(log_dir)
+
+        total   = len(files)
+        done    = 0
+        tm_changed = 0
+        converted  = 0
+        errors     = 0
+        time_re    = re.compile(r"time=(\d+):(\d+):(\d+)\.(\d+)")
+        stream     = _QueueStream(self._output_q)
+
+        self._conv_log(
+            f"[Combined Mode — Converter] {total} file(s)  "
+            f"—  Track Manager (MKV only)  →  Video Converter")
+        if dry_run:
+            self._conv_log(
+                "[DRY RUN — TM will not modify files; conversion will still run]")
+
+        for idx, info in enumerate(files):
+            if self._conv_stop_flag.is_set():
+                info.status = "Cancelled"
+                self.after(0, self._conv_refresh_row, info)
+                continue
+
+            file_num = f"{idx + 1}/{total}"
+
+            # ── Step 1: Track Manager (MKV files only) ────────────────────
+            if info.path.suffix.lower() == ".mkv":
+                info.status = "TM Clean…"
+                self.after(0, self._conv_refresh_row, info)
+                self._output_q.put(
+                    f"── [{file_num}] Track Manager: {info.path.name}\n")
+                try:
+                    with contextlib.redirect_stdout(stream):
+                        changed = core.process_mkv(
+                            str(info.path), dry_run=dry_run, remap_langs=remaps,
+                            keep_langs=keep_langs, spell_check=spell_check,
+                            manage_audio=manage_audio, audio_langs=audio_langs,
+                            preferred_sub_lang=preferred_sub_lang,
+                            preferred_audio_lang=preferred_audio_lang,
+                        )
+                    if changed:
+                        tm_changed += 1
+                except Exception as exc:
+                    self._output_q.put(f"  TM ERROR: {exc}\n")
+                    info.status = "Error"
+                    self.after(0, self._conv_refresh_row, info)
+                    errors += 1
+                    done += 1
+                    self.after(0, self._conv_set_overall, done, total)
+                    continue
+            else:
+                self._conv_log(
+                    f"[{file_num}] Skipping Track Manager (not MKV): {info.path.name}")
+
+            if self._conv_stop_flag.is_set():
+                info.status = "Cancelled"
+                self.after(0, self._conv_refresh_row, info)
+                continue
+
+            # ── Step 2: Video Converter ───────────────────────────────────
+            # Refresh probe data if not yet populated
+            if info.duration == 0:
+                self._conv_probe_sync(info)
+
+            # Skip if already compatible (respects the checkbox)
+            if self._conv_skip_compat_var.get() and info.is_plex_compatible:
+                info.status = "Skipped"
+                self._conv_log(f"[skip] {info.path.name}  (already compatible)")
+                self.after(0, self._conv_refresh_row, info)
+                done += 1
+                self.after(0, self._conv_set_overall, done, total)
+                continue
+
+            output = self._conv_output_path(info)
+            if output.exists() and not self._conv_overwrite_var.get():
+                info.status = "Skipped"
+                self._conv_log(f"[skip] {info.path.name}  (output exists)")
+                self.after(0, self._conv_refresh_row, info)
+                done += 1
+                self.after(0, self._conv_set_overall, done, total)
+                continue
+
+            cmd = self._conv_build_cmd(info, output)
+            self._conv_log(f"\n[Combined {file_num}] {info.path.name}")
+            self._conv_log(f"    →  {output}")
+
+            info.status = "Converting"
+            self.after(0, self._conv_refresh_row, info)
+
+            try:
+                proc = subprocess.Popen(
+                    cmd, stderr=subprocess.PIPE,
+                    universal_newlines=True, encoding="utf-8", errors="replace",
+                )
+                self._conv_current_proc = proc
+
+                for line in proc.stderr:
+                    if self._conv_stop_flag.is_set():
+                        proc.terminate()
+                        break
+                    m = time_re.search(line)
+                    if m and info.duration > 0:
+                        h, mn, s, cs = (int(m.group(i)) for i in range(1, 5))
+                        elapsed = h * 3600 + mn * 60 + s + cs / 100
+                        pct_c   = min(100.0, elapsed / info.duration * 100)
+                        info.progress = pct_c
+                        self.after(0, self._conv_refresh_row, info, f"{pct_c:.0f}%")
+                    elif "error" in line.lower() and "nonfatal" not in line.lower():
+                        self._conv_log(f"    ! {line.rstrip()}")
+
+                ret = proc.wait()
+                self._conv_current_proc = None
+
+                if ret == 0 and not self._conv_stop_flag.is_set():
+                    info.status = "Done"
+                    out_mb = output.stat().st_size / 1_048_576 if output.exists() else 0
+                    ratio  = out_mb / info.size_mb * 100 if info.size_mb else 0
+                    self._conv_log(
+                        f"[done] {info.path.name}  "
+                        f"{info.size_mb:.0f} MB → {out_mb:.0f} MB  ({ratio:.0f}%)")
+                    converted += 1
+                    if self._conv_replace_orig_var.get() and output.exists():
+                        self._conv_do_replace_original(info, output)
+                    elif self._conv_del_orig_var.get() and output.exists():
+                        info.path.unlink()
+                        self._conv_log("  [del] original removed")
+                else:
+                    info.status = "Cancelled" if self._conv_stop_flag.is_set() else "Error"
+                    self._conv_log(f"[fail] {info.path.name}  exit={ret}")
+                    if output.exists():
+                        output.unlink()
+                    if info.status == "Error":
+                        errors += 1
+
+            except Exception as exc:
+                info.status = "Error"
+                self._conv_log(f"[err]  {info.path.name}: {exc}")
+                self._conv_current_proc = None
+                errors += 1
+
+            self.after(0, self._conv_refresh_row, info,
+                       "100%" if info.status == "Done" else "")
+            done += 1
+            self.after(0, self._conv_set_overall, done, total)
+
+        counts = {s: sum(1 for f in files if f.status == s)
+                  for s in ("Done", "Skipped", "Error", "Cancelled")}
+        self._conv_log(
+            f"\n── Combined (Converter) Finished ────────────────────────\n"
+            f"   TM changes: {tm_changed}  Done: {counts['Done']}  "
+            f"Skipped: {counts['Skipped']}  Error: {counts['Error']}  "
+            f"Cancelled: {counts['Cancelled']}"
+        )
+        self.after(0, self._combined_on_done_conv)
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
