@@ -163,6 +163,12 @@ VIDEO_EXTENSIONS = {
 }
 
 PRESETS = {
+    "No Change": {
+        "desc": "Skip conversion entirely — ideal with Combined Run to clean tracks without transcoding",
+        "container": "mkv",  "vcodec": "copy",    "crf": 0,    "preset": "fast",
+        "acodec": "copy",    "abitrate": "320k",  "resolution": "original",
+        "subtitle": "copy",  "skip_compatible": False,
+    },
     "Shield Optimal": {
         "desc": "NVIDIA Shield direct-play: H.265 MKV, AC3/DTS passthrough",
         "container": "mkv",  "vcodec": "libx265", "crf": 20, "preset": "fast",
@@ -1575,6 +1581,13 @@ class App(tk.Tk):
         if name == "Custom":
             return
 
+        if name == "No Change":
+            self._conv_vcodec_var.set("copy  (no re-encode)")
+            self._conv_acodec_var.set("copy  (passthrough)")
+            self._conv_subtitle_var.set("copy")
+            self._conv_skip_compat_var.set(False)
+            return
+
         self._conv_container_var.set(p["container"])
 
         vmap = {"libx264": "libx264  (H.264)",
@@ -1839,10 +1852,21 @@ class App(tk.Tk):
         done  = 0
         time_re = re.compile(r"time=(\d+):(\d+):(\d+)\.(\d+)")
 
+        no_change = (self._conv_preset_var.get() == "No Change")
+
         for info in files:
             if self._conv_stop_flag.is_set():
                 info.status = "Cancelled"
                 self.after(0, self._conv_refresh_row, info)
+                continue
+
+            # No Change preset — skip conversion entirely
+            if no_change:
+                info.status = "Skipped"
+                self._conv_log(f"[no-change] {info.path.name}  (conversion skipped by preset)")
+                self.after(0, self._conv_refresh_row, info)
+                done += 1
+                self.after(0, self._conv_set_overall, done, total)
                 continue
 
             # Skip compatible?
@@ -2187,6 +2211,10 @@ class App(tk.Tk):
                 break
 
             # ── Step 2: Video Converter ───────────────────────────────────
+            if self._conv_preset_var.get() == "No Change":
+                self._conv_log(f"[no-change] {f.name}  (conversion skipped by preset)")
+                continue
+
             self.after(0, _upd_progress, pct_step, "Converting")
             info = FileInfo(path=f, size_mb=f.stat().st_size / 1_048_576)
             self._conv_probe_sync(info)   # fills duration for progress %
@@ -2387,6 +2415,14 @@ class App(tk.Tk):
                 continue
 
             # ── Step 2: Video Converter ───────────────────────────────────
+            if self._conv_preset_var.get() == "No Change":
+                info.status = "Skipped"
+                self._conv_log(f"[no-change] {info.path.name}  (conversion skipped by preset)")
+                self.after(0, self._conv_refresh_row, info)
+                done += 1
+                self.after(0, self._conv_set_overall, done, total)
+                continue
+
             # Refresh probe data if not yet populated
             if info.duration == 0:
                 self._conv_probe_sync(info)
