@@ -32,6 +32,7 @@ Requirements:
 """
 
 import contextlib
+import hashlib
 import json
 import os
 import queue
@@ -61,6 +62,7 @@ _BMC_URL = "https://buymeacoffee.com/mkvsubdoctor"
 _SCRIPT_DIR = Path(__file__).parent
 _BMC_IMG    = _SCRIPT_DIR / "bmc-button.png"
 _CONFIG     = _SCRIPT_DIR / "mkv_subdoctor_config.json"
+_HISTORY    = _SCRIPT_DIR / "mkv_subdoctor_history.json"
 sys.path.insert(0, str(_SCRIPT_DIR))
 
 try:
@@ -281,6 +283,7 @@ class App(tk.Tk):
         self._ffmpeg  = self._find_exe("ffmpeg")
         self._ffprobe = self._find_exe("ffprobe")
         self._conv_probe_sem = threading.Semaphore(4)
+        self._history_lock   = threading.Lock()
 
         # Load saved preferences
         prefs = self._load_prefs()
@@ -319,8 +322,9 @@ class App(tk.Tk):
                     "tm_audio_langs":    list(self._audio_lang_lb.get(0, "end")),
                     "tm_log_dir":        self._log_dir_var.get(),
                     "tm_remaps":         list(self._remap_lb.get(0, "end")),
-                    "tm_sub_primary":    self._sub_primary_var.get(),
-                    "tm_audio_primary":  self._audio_primary_var.get(),
+                    "tm_sub_primary":      self._sub_primary_var.get(),
+                    "tm_audio_primary":    self._audio_primary_var.get(),
+                    "tm_skip_processed":   self._tm_skip_processed_var.get(),
                 })
 
             # ── Video Converter ───────────────────────────────────────────
@@ -339,8 +343,9 @@ class App(tk.Tk):
                     "conv_subtitle":     self._conv_subtitle_var.get(),
                     "conv_skip_compat":  self._conv_skip_compat_var.get(),
                     "conv_overwrite":    self._conv_overwrite_var.get(),
-                    "conv_del_orig":     self._conv_del_orig_var.get(),
-                    "conv_replace_orig": self._conv_replace_orig_var.get(),
+                    "conv_del_orig":        self._conv_del_orig_var.get(),
+                    "conv_replace_orig":    self._conv_replace_orig_var.get(),
+                    "conv_skip_processed":  self._conv_skip_processed_var.get(),
                 })
 
             _CONFIG.write_text(json.dumps(prefs, indent=2), encoding="utf-8")
@@ -388,6 +393,8 @@ class App(tk.Tk):
         self._sub_primary_var.set(  prefs.get("tm_sub_primary",   "(auto)"))
         self._audio_primary_var.set(prefs.get("tm_audio_primary", "(auto)"))
 
+        self._tm_skip_processed_var.set(prefs.get("tm_skip_processed", False))
+
         # Refresh disabled state of audio options sub-panel
         self._on_manage_audio_toggle()
 
@@ -412,8 +419,9 @@ class App(tk.Tk):
         self._conv_subtitle_var.set(   prefs.get("conv_subtitle",    "copy"))
         self._conv_skip_compat_var.set( prefs.get("conv_skip_compat", True))
         self._conv_overwrite_var.set(  prefs.get("conv_overwrite",   False))
-        self._conv_del_orig_var.set(   prefs.get("conv_del_orig",    False))
-        self._conv_replace_orig_var.set(prefs.get("conv_replace_orig", False))
+        self._conv_del_orig_var.set(    prefs.get("conv_del_orig",       False))
+        self._conv_replace_orig_var.set(prefs.get("conv_replace_orig",  False))
+        self._conv_skip_processed_var.set(prefs.get("conv_skip_processed", False))
 
         # Update preset description label
         p = PRESETS.get(prefs.get("conv_preset", "Shield Optimal"), PRESETS["Custom"])
@@ -423,6 +431,111 @@ class App(tk.Tk):
         """Save all settings then close the window."""
         self._save_prefs()
         self.destroy()
+
+    # ── Processing history ────────────────────────────────────────────────────
+
+    def _history_load(self) -> dict:
+        """Load the history database from disk; returns {} on any error."""
+        try:
+            if _HISTORY.exists():
+                return json.loads(_HISTORY.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+        return {}
+
+    def _history_save(self, history: dict):
+        """Write the history database to disk."""
+        try:
+            _HISTORY.write_text(json.dumps(history, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+
+    def _history_check(self, path: Path, op_hash: str) -> bool:
+        """Return True if this file was already processed with the same options.
+
+        Match criteria:
+          • file size in bytes must be identical
+          • mtime must be within 2 seconds (FAT32 tolerance)
+          • op_hash (MD5 of options) must be identical
+        """
+        try:
+            st = path.stat()
+        except OSError:
+            return False
+        with self._history_lock:
+            history = self._history_load()
+        entry = history.get(str(path))
+        if not entry:
+            return False
+        return (
+            entry.get("size")    == st.st_size
+            and abs(entry.get("mtime", 0) - st.st_mtime) <= 2.0
+            and entry.get("op_hash") == op_hash
+        )
+
+    def _history_record(self, path: Path, op_hash: str):
+        """Record a successful processing run for *path* using its current stats."""
+        try:
+            st = path.stat()
+            self._history_record_at(path, st.st_size, st.st_mtime, op_hash)
+        except OSError:
+            pass
+
+    def _history_record_at(self, path: Path, size: int, mtime: float, op_hash: str):
+        """Record a successful processing run using pre-captured file stats.
+
+        Use this variant when the file may have been renamed/deleted (replace-original)
+        and you captured size/mtime BEFORE the operation.
+        """
+        import datetime
+        with self._history_lock:
+            history = self._history_load()
+            history[str(path)] = {
+                "size":         size,
+                "mtime":        mtime,
+                "op_hash":      op_hash,
+                "processed_at": datetime.datetime.now().isoformat(timespec="seconds"),
+            }
+            self._history_save(history)
+
+    def _history_clear(self):
+        """Delete the history database file and log the action."""
+        try:
+            if _HISTORY.exists():
+                _HISTORY.unlink()
+            self._output_q.put("[history] Processing history cleared.\n")
+        except Exception as e:
+            self._output_q.put(f"[history] Could not clear history: {e}\n")
+
+    def _compute_tm_hash(self, keep_langs, remaps, manage_audio, audio_langs,
+                         preferred_sub_lang, preferred_audio_lang, spell_check) -> str:
+        """MD5 (first 16 hex chars) of the Track Manager option set."""
+        payload = json.dumps({
+            "keep_langs":           sorted(keep_langs),
+            "remaps":               sorted(remaps) if remaps else [],
+            "manage_audio":         manage_audio,
+            "audio_langs":          sorted(audio_langs) if audio_langs else [],
+            "preferred_sub_lang":   preferred_sub_lang,
+            "preferred_audio_lang": preferred_audio_lang,
+            "spell_check":          spell_check,
+        }, sort_keys=True)
+        return hashlib.md5(payload.encode()).hexdigest()[:16]
+
+    def _compute_conv_hash(self) -> str:
+        """MD5 (first 16 hex chars) of the Video Converter option set."""
+        payload = json.dumps({
+            "preset":      self._conv_preset_var.get(),
+            "container":   self._conv_container_var.get(),
+            "vcodec":      self._conv_vcodec_var.get(),
+            "crf":         self._conv_crf_var.get(),
+            "enc_preset":  self._conv_enc_preset_var.get(),
+            "resolution":  self._conv_resolution_var.get(),
+            "hwaccel":     self._conv_hwaccel_var.get(),
+            "acodec":      self._conv_acodec_var.get(),
+            "abitrate":    self._conv_abitrate_var.get(),
+            "subtitle":    self._conv_subtitle_var.get(),
+        }, sort_keys=True)
+        return hashlib.md5(payload.encode()).hexdigest()[:16]
 
     # ── ffmpeg / ffprobe discovery ────────────────────────────────────────────
 
@@ -781,14 +894,22 @@ class App(tk.Tk):
         self._right_canvas.bind("<Leave>", lambda _e: self._right_canvas.unbind_all("<MouseWheel>"))
 
         # Toggle options
-        self._recursive_var   = tk.BooleanVar(value=True)
-        self._dry_run_var     = tk.BooleanVar(value=False)
-        self._no_log_var      = tk.BooleanVar(value=False)
-        self._spell_check_var = tk.BooleanVar(value=False)
+        self._recursive_var        = tk.BooleanVar(value=True)
+        self._dry_run_var          = tk.BooleanVar(value=False)
+        self._no_log_var           = tk.BooleanVar(value=False)
+        self._spell_check_var      = tk.BooleanVar(value=False)
+        self._tm_skip_processed_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(right, text="Recursive",       variable=self._recursive_var).pack(anchor="w", pady=2)
         ttk.Checkbutton(right, text="Dry Run",         variable=self._dry_run_var).pack(anchor="w", pady=2)
         ttk.Checkbutton(right, text="Disable Logging", variable=self._no_log_var).pack(anchor="w", pady=2)
         ttk.Checkbutton(right, text="Spell Check",     variable=self._spell_check_var).pack(anchor="w", pady=2)
+
+        skip_row = ttk.Frame(right)
+        skip_row.pack(fill="x", pady=2)
+        ttk.Checkbutton(skip_row, text="Skip already processed",
+                        variable=self._tm_skip_processed_var).pack(side="left")
+        ttk.Button(skip_row, text="Clear History", command=self._history_clear,
+                   width=13).pack(side="right")
 
         ttk.Separator(right, orient="horizontal").pack(fill="x", pady=8)
 
@@ -1202,6 +1323,9 @@ class App(tk.Tk):
         self._conv_replace_orig_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(optf, text="Replace original (delete + rename, removes _plex)",
                         variable=self._conv_replace_orig_var).pack(anchor="w", padx=8, pady=2)
+        self._conv_skip_processed_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(optf, text="Skip already processed files",
+                        variable=self._conv_skip_processed_var).pack(anchor="w", padx=8, pady=2)
 
         # Apply initial preset
         self._conv_apply_preset()
@@ -1539,8 +1663,12 @@ class App(tk.Tk):
             self._output_q.put("[DRY RUN MODE — no files will be modified]\n")
         self._output_q.put("\n")
 
-        modified = 0
-        errors   = 0
+        modified       = 0
+        errors         = 0
+        skip_processed = self._tm_skip_processed_var.get()
+        tm_hash        = self._compute_tm_hash(keep_langs, remaps, manage_audio,
+                                               audio_langs, preferred_sub_lang,
+                                               preferred_audio_lang, spell_check)
 
         stream = _QueueStream(self._output_q)
         with contextlib.redirect_stdout(stream):
@@ -1548,6 +1676,11 @@ class App(tk.Tk):
                 if core._check_pause_stop():
                     self._output_q.put("\nProcessing stopped by user.\n")
                     break
+                # Skip if already processed with current settings
+                if skip_processed and not dry_run and self._history_check(f, tm_hash):
+                    print(f"Processing: {f}")
+                    print("  Already processed with current settings — skipping.")
+                    continue
                 try:
                     if core.process_mkv(str(f), dry_run=dry_run,
                                         remap_langs=remaps, keep_langs=keep_langs,
@@ -1557,6 +1690,8 @@ class App(tk.Tk):
                                         preferred_sub_lang=preferred_sub_lang,
                                         preferred_audio_lang=preferred_audio_lang):
                         modified += 1
+                    if not dry_run:
+                        self._history_record(f, tm_hash)
                 except Exception as exc:
                     self._output_q.put(f"  UNHANDLED ERROR for '{f}': {exc}\n")
                     errors += 1
@@ -1848,11 +1983,12 @@ class App(tk.Tk):
     # ── Video Converter: worker thread ────────────────────────────────────────
 
     def _conv_worker(self, files: List[FileInfo]):
-        total = len(files)
-        done  = 0
-        time_re = re.compile(r"time=(\d+):(\d+):(\d+)\.(\d+)")
-
-        no_change = (self._conv_preset_var.get() == "No Change")
+        total          = len(files)
+        done           = 0
+        time_re        = re.compile(r"time=(\d+):(\d+):(\d+)\.(\d+)")
+        no_change      = (self._conv_preset_var.get() == "No Change")
+        skip_processed = self._conv_skip_processed_var.get()
+        conv_hash      = self._compute_conv_hash()
 
         for info in files:
             if self._conv_stop_flag.is_set():
@@ -1864,6 +2000,16 @@ class App(tk.Tk):
             if no_change:
                 info.status = "Skipped"
                 self._conv_log(f"[no-change] {info.path.name}  (conversion skipped by preset)")
+                self.after(0, self._conv_refresh_row, info)
+                done += 1
+                self.after(0, self._conv_set_overall, done, total)
+                continue
+
+            # Skip if already processed with current settings
+            if skip_processed and self._history_check(info.path, conv_hash):
+                info.status = "Skipped"
+                self._conv_log(
+                    f"[skip] {info.path.name}  (already processed with current settings)")
                 self.after(0, self._conv_refresh_row, info)
                 done += 1
                 self.after(0, self._conv_set_overall, done, total)
@@ -1887,6 +2033,14 @@ class App(tk.Tk):
                 done += 1
                 self.after(0, self._conv_set_overall, done, total)
                 continue
+
+            # Capture pre-conversion stats for history (before file may be renamed/deleted)
+            pre_size, pre_mtime = 0, 0.0
+            try:
+                _st = info.path.stat()
+                pre_size, pre_mtime = _st.st_size, _st.st_mtime
+            except OSError:
+                pass
 
             cmd = self._conv_build_cmd(info, output)
             self._conv_log(f"\n[start] {info.path.name}")
@@ -1928,6 +2082,9 @@ class App(tk.Tk):
                     self._conv_log(
                         f"[done] {info.path.name}  "
                         f"{info.size_mb:.0f} MB → {out_mb:.0f} MB  ({ratio:.0f}%)")
+
+                    # Record history before any rename/delete changes the path
+                    self._history_record_at(info.path, pre_size, pre_mtime, conv_hash)
 
                     if self._conv_replace_orig_var.get() and output.exists():
                         output = self._conv_do_replace_original(info, output)
@@ -2166,11 +2323,16 @@ class App(tk.Tk):
                 "conversion step will still run]\n")
         self._output_q.put("\n")
 
-        tm_changed = 0
-        converted  = 0
-        errors     = 0
-        time_re    = re.compile(r"time=(\d+):(\d+):(\d+)\.(\d+)")
-        stream     = _QueueStream(self._output_q)
+        tm_changed     = 0
+        converted      = 0
+        errors         = 0
+        time_re        = re.compile(r"time=(\d+):(\d+):(\d+)\.(\d+)")
+        stream         = _QueueStream(self._output_q)
+        skip_processed = self._tm_skip_processed_var.get()
+        tm_hash        = self._compute_tm_hash(keep_langs, remaps, manage_audio,
+                                               audio_langs, preferred_sub_lang,
+                                               preferred_audio_lang, spell_check)
+        conv_hash      = self._compute_conv_hash()
 
         for idx, f in enumerate(mkv_files):
             if core._stop_event.is_set():
@@ -2190,21 +2352,30 @@ class App(tk.Tk):
             # ── Step 1: Track Manager ─────────────────────────────────────
             self.after(0, _upd_progress, pct_step, "TM")
             self._output_q.put(f"── [{file_num}] Track Manager ──────────────────\n")
-            try:
-                with contextlib.redirect_stdout(stream):
-                    changed = core.process_mkv(
-                        str(f), dry_run=dry_run, remap_langs=remaps,
-                        keep_langs=keep_langs, spell_check=spell_check,
-                        manage_audio=manage_audio, audio_langs=audio_langs,
-                        preferred_sub_lang=preferred_sub_lang,
-                        preferred_audio_lang=preferred_audio_lang,
-                    )
-                if changed:
-                    tm_changed += 1
-            except Exception as exc:
-                self._output_q.put(f"  TM ERROR: {exc}\n")
-                errors += 1
-                continue
+            # Skip TM step if already processed with current settings
+            if skip_processed and not dry_run and self._history_check(f, tm_hash):
+                self._output_q.put(
+                    f"  Already processed with current TM settings — skipping TM.\n")
+                tm_skipped = True
+            else:
+                tm_skipped = False
+                try:
+                    with contextlib.redirect_stdout(stream):
+                        changed = core.process_mkv(
+                            str(f), dry_run=dry_run, remap_langs=remaps,
+                            keep_langs=keep_langs, spell_check=spell_check,
+                            manage_audio=manage_audio, audio_langs=audio_langs,
+                            preferred_sub_lang=preferred_sub_lang,
+                            preferred_audio_lang=preferred_audio_lang,
+                        )
+                    if changed:
+                        tm_changed += 1
+                    if not dry_run:
+                        self._history_record(f, tm_hash)
+                except Exception as exc:
+                    self._output_q.put(f"  TM ERROR: {exc}\n")
+                    errors += 1
+                    continue
 
             if core._stop_event.is_set():
                 self._output_q.put("\nCombined run stopped by user.\n")
@@ -2213,6 +2384,12 @@ class App(tk.Tk):
             # ── Step 2: Video Converter ───────────────────────────────────
             if self._conv_preset_var.get() == "No Change":
                 self._conv_log(f"[no-change] {f.name}  (conversion skipped by preset)")
+                continue
+
+            # Skip conv step if already processed with current conv settings
+            if self._conv_skip_processed_var.get() and self._history_check(f, conv_hash):
+                self._conv_log(
+                    f"[skip] {f.name}  (already processed with current conv settings)")
                 continue
 
             self.after(0, _upd_progress, pct_step, "Converting")
@@ -2224,6 +2401,15 @@ class App(tk.Tk):
                 cmd    = self._conv_build_cmd(info, output)
                 self._conv_log(f"\n[Combined {file_num}] {f.name}")
                 self._conv_log(f"    →  {output}")
+
+                # Capture pre-conversion stats for history
+                pre_size, pre_mtime = 0, 0.0
+                try:
+                    _st = f.stat()
+                    pre_size, pre_mtime = _st.st_size, _st.st_mtime
+                except OSError:
+                    pass
+
                 try:
                     proc = subprocess.Popen(
                         cmd, stderr=subprocess.PIPE,
@@ -2254,6 +2440,7 @@ class App(tk.Tk):
                             f"[done] {f.name}  "
                             f"{info.size_mb:.0f} MB → {out_mb:.0f} MB  ({ratio:.0f}%)")
                         converted += 1
+                        self._history_record_at(f, pre_size, pre_mtime, conv_hash)
                         if self._conv_replace_orig_var.get() and output.exists():
                             self._conv_do_replace_original(info, output)
                         elif self._conv_del_orig_var.get() and output.exists():
@@ -2357,13 +2544,18 @@ class App(tk.Tk):
         else:
             core._LOG_DIR = Path(log_dir)
 
-        total   = len(files)
-        done    = 0
-        tm_changed = 0
-        converted  = 0
-        errors     = 0
-        time_re    = re.compile(r"time=(\d+):(\d+):(\d+)\.(\d+)")
-        stream     = _QueueStream(self._output_q)
+        total          = len(files)
+        done           = 0
+        tm_changed     = 0
+        converted      = 0
+        errors         = 0
+        time_re        = re.compile(r"time=(\d+):(\d+):(\d+)\.(\d+)")
+        stream         = _QueueStream(self._output_q)
+        skip_processed = self._tm_skip_processed_var.get()
+        tm_hash        = self._compute_tm_hash(keep_langs, remaps, manage_audio,
+                                               audio_langs, preferred_sub_lang,
+                                               preferred_audio_lang, spell_check)
+        conv_hash      = self._compute_conv_hash()
 
         self._conv_log(
             f"[Combined Mode — Converter] {total} file(s)  "
@@ -2382,29 +2574,36 @@ class App(tk.Tk):
 
             # ── Step 1: Track Manager (MKV files only) ────────────────────
             if info.path.suffix.lower() == ".mkv":
-                info.status = "TM Clean…"
-                self.after(0, self._conv_refresh_row, info)
-                self._output_q.put(
-                    f"── [{file_num}] Track Manager: {info.path.name}\n")
-                try:
-                    with contextlib.redirect_stdout(stream):
-                        changed = core.process_mkv(
-                            str(info.path), dry_run=dry_run, remap_langs=remaps,
-                            keep_langs=keep_langs, spell_check=spell_check,
-                            manage_audio=manage_audio, audio_langs=audio_langs,
-                            preferred_sub_lang=preferred_sub_lang,
-                            preferred_audio_lang=preferred_audio_lang,
-                        )
-                    if changed:
-                        tm_changed += 1
-                except Exception as exc:
-                    self._output_q.put(f"  TM ERROR: {exc}\n")
-                    info.status = "Error"
+                # Skip TM if already processed with current settings
+                if skip_processed and not dry_run and self._history_check(info.path, tm_hash):
+                    self._output_q.put(
+                        f"── [{file_num}] TM skipped (already processed): {info.path.name}\n")
+                else:
+                    info.status = "TM Clean…"
                     self.after(0, self._conv_refresh_row, info)
-                    errors += 1
-                    done += 1
-                    self.after(0, self._conv_set_overall, done, total)
-                    continue
+                    self._output_q.put(
+                        f"── [{file_num}] Track Manager: {info.path.name}\n")
+                    try:
+                        with contextlib.redirect_stdout(stream):
+                            changed = core.process_mkv(
+                                str(info.path), dry_run=dry_run, remap_langs=remaps,
+                                keep_langs=keep_langs, spell_check=spell_check,
+                                manage_audio=manage_audio, audio_langs=audio_langs,
+                                preferred_sub_lang=preferred_sub_lang,
+                                preferred_audio_lang=preferred_audio_lang,
+                            )
+                        if changed:
+                            tm_changed += 1
+                        if not dry_run:
+                            self._history_record(info.path, tm_hash)
+                    except Exception as exc:
+                        self._output_q.put(f"  TM ERROR: {exc}\n")
+                        info.status = "Error"
+                        self.after(0, self._conv_refresh_row, info)
+                        errors += 1
+                        done += 1
+                        self.after(0, self._conv_set_overall, done, total)
+                        continue
             else:
                 self._conv_log(
                     f"[{file_num}] Skipping Track Manager (not MKV): {info.path.name}")
@@ -2418,6 +2617,16 @@ class App(tk.Tk):
             if self._conv_preset_var.get() == "No Change":
                 info.status = "Skipped"
                 self._conv_log(f"[no-change] {info.path.name}  (conversion skipped by preset)")
+                self.after(0, self._conv_refresh_row, info)
+                done += 1
+                self.after(0, self._conv_set_overall, done, total)
+                continue
+
+            # Skip conv step if already processed with current conv settings
+            if self._conv_skip_processed_var.get() and self._history_check(info.path, conv_hash):
+                info.status = "Skipped"
+                self._conv_log(
+                    f"[skip] {info.path.name}  (already processed with current conv settings)")
                 self.after(0, self._conv_refresh_row, info)
                 done += 1
                 self.after(0, self._conv_set_overall, done, total)
@@ -2444,6 +2653,14 @@ class App(tk.Tk):
                 done += 1
                 self.after(0, self._conv_set_overall, done, total)
                 continue
+
+            # Capture pre-conversion stats for history
+            pre_size, pre_mtime = 0, 0.0
+            try:
+                _st = info.path.stat()
+                pre_size, pre_mtime = _st.st_size, _st.st_mtime
+            except OSError:
+                pass
 
             cmd = self._conv_build_cmd(info, output)
             self._conv_log(f"\n[Combined {file_num}] {info.path.name}")
@@ -2484,6 +2701,7 @@ class App(tk.Tk):
                         f"[done] {info.path.name}  "
                         f"{info.size_mb:.0f} MB → {out_mb:.0f} MB  ({ratio:.0f}%)")
                     converted += 1
+                    self._history_record_at(info.path, pre_size, pre_mtime, conv_hash)
                     if self._conv_replace_orig_var.get() and output.exists():
                         self._conv_do_replace_original(info, output)
                     elif self._conv_del_orig_var.get() and output.exists():
