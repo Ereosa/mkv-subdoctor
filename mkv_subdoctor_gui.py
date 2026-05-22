@@ -764,13 +764,16 @@ class App(tk.Tk):
         bar = ttk.Frame(parent, padding=(5, 3))
         bar.grid(row=1, column=0, sticky="ew")
 
-        self._start_btn = ttk.Button(bar, text="  Start",        command=self._start,        width=12)
-        self._pause_btn = ttk.Button(bar, text="  Pause",        command=self._toggle_pause, width=12, state="disabled")
-        self._stop_btn  = ttk.Button(bar, text="  Stop",         command=self._stop,         width=12, state="disabled")
+        self._start_btn    = ttk.Button(bar, text="  Start",        command=self._start,          width=12)
+        self._pause_btn    = ttk.Button(bar, text="  Pause",        command=self._toggle_pause,   width=12, state="disabled")
+        self._stop_btn     = ttk.Button(bar, text="  Stop",         command=self._stop,           width=12, state="disabled")
+        self._combined_btn = ttk.Button(bar, text="▶ Combined Run", command=self._combined_start, width=16)
 
         self._start_btn.pack(side="left", padx=4)
         self._pause_btn.pack(side="left", padx=4)
         self._stop_btn.pack(side="left",  padx=4)
+        ttk.Separator(bar, orient="vertical").pack(side="left", fill="y", padx=6, pady=3)
+        self._combined_btn.pack(side="left", padx=4)
 
         self._status_lbl = ttk.Label(bar, text="Ready.", width=28)
         self._status_lbl.pack(side="left", padx=10)
@@ -1329,6 +1332,8 @@ class App(tk.Tk):
         self._start_btn.configure(state="disabled")
         self._pause_btn.configure(state="normal", text="  Pause")
         self._stop_btn.configure(state="normal")
+        self._combined_btn.configure(state="disabled")
+        self._conv_start_btn.configure(state="disabled")
 
         self._worker = threading.Thread(
             target=self._worker_func,
@@ -1360,6 +1365,8 @@ class App(tk.Tk):
         self._start_btn.configure(state="normal")
         self._pause_btn.configure(state="disabled", text="  Pause")
         self._stop_btn.configure(state="disabled")
+        self._combined_btn.configure(state="normal")
+        self._conv_start_btn.configure(state="normal")
         self._progress["value"] = 100
         self._pct_lbl.configure(text="100%")
         stopped = core._stop_event.is_set()
@@ -1564,6 +1571,36 @@ class App(tk.Tk):
         except Exception as e:
             self._conv_log(f"Probe error — {info.path.name}: {e}")
 
+    # ── Video Converter: synchronous probe (no treeview update) ──────────────
+
+    def _conv_probe_sync(self, info: FileInfo):
+        """Probe a file for duration/codec info without touching the treeview.
+        Intended for use from worker threads (combined run mode)."""
+        if not self._ffprobe:
+            return
+        try:
+            result = subprocess.run(
+                [self._ffprobe, "-v", "quiet", "-print_format", "json",
+                 "-show_streams", "-show_format", str(info.path)],
+                capture_output=True, text=True, timeout=30,
+            )
+            if not result.stdout:
+                return
+            data = json.loads(result.stdout)
+            for stream in data.get("streams", []):
+                ct = stream.get("codec_type", "")
+                if ct == "video" and info.video_codec == "—":
+                    info.video_codec = stream.get("codec_name", "?")
+                    w = stream.get("width",  0)
+                    h = stream.get("height", 0)
+                    info.resolution  = f"{w}×{h}" if w else "?"
+                elif ct == "audio" and info.audio_codec == "—":
+                    info.audio_codec = stream.get("codec_name", "?")
+            fmt           = data.get("format", {})
+            info.duration = float(fmt.get("duration", 0))
+        except Exception:
+            pass  # duration stays 0; progress won't show percentage
+
     # ── Video Converter: tree row update ──────────────────────────────────────
 
     def _conv_refresh_row(self, info: FileInfo, prog_text: str = ""):
@@ -1610,6 +1647,8 @@ class App(tk.Tk):
         self._conv_stop_flag.clear()
         self._conv_start_btn.configure(state="disabled")
         self._conv_stop_btn.configure(state="normal")
+        self._combined_btn.configure(state="disabled")
+        self._start_btn.configure(state="disabled")
         threading.Thread(
             target=self._conv_worker, args=(pending,), daemon=True).start()
 
@@ -1627,6 +1666,8 @@ class App(tk.Tk):
         self._conv_converting = False
         self._conv_start_btn.configure(state="normal")
         self._conv_stop_btn.configure(state="disabled")
+        self._combined_btn.configure(state="normal")
+        self._start_btn.configure(state="normal")
 
     def _conv_set_overall(self, done: int, total: int):
         self._conv_overall_bar["value"] = done / total * 100 if total else 0
@@ -1825,6 +1866,228 @@ class App(tk.Tk):
 
         cmd.append(str(output))
         return cmd
+
+
+    # ── Combined Run (Track Manager → Video Converter) ────────────────────────
+
+    def _combined_start(self):
+        paths = list(self._path_lb.get(0, "end"))
+        if not paths:
+            messagebox.showwarning("No Input",
+                "Add at least one MKV file or folder in the Track Manager tab before starting.")
+            return
+
+        if not self._ffmpeg:
+            messagebox.showerror(
+                "ffmpeg not found",
+                "Combined mode requires ffmpeg for the conversion step.\n\n"
+                "ffmpeg.exe was not found on PATH or in C:\\ffmpeg\\bin.\n"
+                "Download from https://ffmpeg.org/download.html",
+            )
+            return
+
+        keep_langs         = self._get_keep_langs()
+        remaps             = self._get_remaps()
+        dry_run            = self._dry_run_var.get()
+        recursive          = self._recursive_var.get()
+        no_log             = self._no_log_var.get()
+        spell_check        = self._spell_check_var.get()
+        manage_audio       = self._manage_audio_var.get()
+        audio_langs        = self._get_audio_langs()
+        log_dir            = self._log_dir_var.get()
+        _sp = self._sub_primary_var.get()
+        _ap = self._audio_primary_var.get()
+        preferred_sub_lang   = None if _sp == "(auto)" else _sp
+        preferred_audio_lang = None if _ap == "(auto)" else _ap
+
+        core._pause_event.set()
+        core._stop_event.clear()
+        self._conv_stop_flag.clear()
+
+        self._done  = 0
+        self._total = 0
+        self._progress["value"] = 0
+        self._pct_lbl.configure(text="")
+        self._status_lbl.configure(text="Combined: starting…")
+        self._paused = False
+
+        # Lock all start/stop buttons — Stop in TM bar halts everything
+        self._start_btn.configure(state="disabled")
+        self._pause_btn.configure(state="disabled")
+        self._stop_btn.configure(state="normal")
+        self._combined_btn.configure(state="disabled")
+        self._conv_start_btn.configure(state="disabled")
+        self._conv_stop_btn.configure(state="disabled")
+
+        self._worker = threading.Thread(
+            target=self._combined_worker,
+            args=(paths, keep_langs, remaps, dry_run, recursive, no_log,
+                  spell_check, manage_audio, audio_langs, log_dir,
+                  preferred_sub_lang, preferred_audio_lang),
+            daemon=True,
+        )
+        self._worker.start()
+
+    def _combined_on_done(self):
+        self._start_btn.configure(state="normal")
+        self._pause_btn.configure(state="disabled", text="  Pause")
+        self._stop_btn.configure(state="disabled")
+        self._combined_btn.configure(state="normal")
+        self._conv_start_btn.configure(state="normal")
+        self._conv_stop_btn.configure(state="disabled")
+        self._progress["value"] = 100
+        self._pct_lbl.configure(text="100%")
+        stopped = core._stop_event.is_set()
+        self._status_lbl.configure(
+            text="Combined: stopped." if stopped else
+            f"Combined: done.  {self._done}/{self._total} files")
+
+    def _combined_worker(self, paths, keep_langs, remaps, dry_run, recursive, no_log,
+                         spell_check, manage_audio, audio_langs, log_dir,
+                         preferred_sub_lang=None, preferred_audio_lang=None):
+        if no_log:
+            core._LOG_DIR = None
+        else:
+            core._LOG_DIR = Path(log_dir)
+
+        # Collect MKV files (same logic as _worker_func)
+        mkv_files: list[Path] = []
+        for raw in paths:
+            p = Path(raw)
+            if p.is_file() and p.suffix.lower() == ".mkv":
+                mkv_files.append(p)
+            elif p.is_dir():
+                pattern = "**/*.mkv" if recursive else "*.mkv"
+                mkv_files.extend(sorted(p.glob(pattern)))
+
+        if not mkv_files:
+            self._output_q.put("No MKV files found in the selected paths.\n")
+            self.after(0, self._combined_on_done)
+            return
+
+        total = len(mkv_files)
+        self._total = total
+        self._output_q.put(
+            f"[Combined Mode] {total} file(s)  "
+            f"—  Track Manager  →  Video Converter\n")
+        self._output_q.put(f"Keeping languages: {sorted(keep_langs)}\n")
+        if remaps:
+            self._output_q.put(f"Language remaps: {remaps}\n")
+        if dry_run:
+            self._output_q.put(
+                "[DRY RUN — Track Manager will not modify files; "
+                "conversion step will still run]\n")
+        self._output_q.put("\n")
+
+        tm_changed = 0
+        converted  = 0
+        errors     = 0
+        time_re    = re.compile(r"time=(\d+):(\d+):(\d+)\.(\d+)")
+        stream     = _QueueStream(self._output_q)
+
+        for idx, f in enumerate(mkv_files):
+            if core._stop_event.is_set():
+                self._output_q.put("\nCombined run stopped by user.\n")
+                break
+
+            file_num = f"{idx + 1}/{total}"
+            self._done = idx + 1
+
+            def _upd_progress(pct, label, d=self._done, t=total):
+                self._progress["value"] = pct
+                self._pct_lbl.configure(text=f"{pct}%")
+                self._status_lbl.configure(text=f"{label}: {d}/{t}")
+
+            pct_step = int(100 * (idx + 1) / total)
+
+            # ── Step 1: Track Manager ─────────────────────────────────────
+            self.after(0, _upd_progress, pct_step, "TM")
+            self._output_q.put(f"── [{file_num}] Track Manager ──────────────────\n")
+            try:
+                with contextlib.redirect_stdout(stream):
+                    changed = core.process_mkv(
+                        str(f), dry_run=dry_run, remap_langs=remaps,
+                        keep_langs=keep_langs, spell_check=spell_check,
+                        manage_audio=manage_audio, audio_langs=audio_langs,
+                        preferred_sub_lang=preferred_sub_lang,
+                        preferred_audio_lang=preferred_audio_lang,
+                    )
+                if changed:
+                    tm_changed += 1
+            except Exception as exc:
+                self._output_q.put(f"  TM ERROR: {exc}\n")
+                errors += 1
+                continue
+
+            if core._stop_event.is_set():
+                self._output_q.put("\nCombined run stopped by user.\n")
+                break
+
+            # ── Step 2: Video Converter ───────────────────────────────────
+            self.after(0, _upd_progress, pct_step, "Converting")
+            info = FileInfo(path=f, size_mb=f.stat().st_size / 1_048_576)
+            self._conv_probe_sync(info)   # fills duration for progress %
+
+            if not dry_run:
+                output = self._conv_output_path(info)
+                cmd    = self._conv_build_cmd(info, output)
+                self._conv_log(f"\n[Combined {file_num}] {f.name}")
+                self._conv_log(f"    →  {output}")
+                try:
+                    proc = subprocess.Popen(
+                        cmd, stderr=subprocess.PIPE,
+                        universal_newlines=True, encoding="utf-8", errors="replace",
+                    )
+                    self._conv_current_proc = proc
+
+                    for line in proc.stderr:
+                        if core._stop_event.is_set():
+                            proc.terminate()
+                            break
+                        m = time_re.search(line)
+                        if m and info.duration > 0:
+                            h, mn, s, cs = (int(m.group(i)) for i in range(1, 5))
+                            elapsed = h * 3600 + mn * 60 + s + cs / 100
+                            pct_c   = min(100.0, elapsed / info.duration * 100)
+                            self._conv_log(f"  {f.name}  {pct_c:.0f}%")
+                        elif "error" in line.lower() and "nonfatal" not in line.lower():
+                            self._conv_log(f"    ! {line.rstrip()}")
+
+                    ret = proc.wait()
+                    self._conv_current_proc = None
+
+                    if ret == 0 and not core._stop_event.is_set():
+                        out_mb = output.stat().st_size / 1_048_576 if output.exists() else 0
+                        ratio  = out_mb / info.size_mb * 100 if info.size_mb else 0
+                        self._conv_log(
+                            f"[done] {f.name}  "
+                            f"{info.size_mb:.0f} MB → {out_mb:.0f} MB  ({ratio:.0f}%)")
+                        converted += 1
+                        if self._conv_del_orig_var.get() and output.exists():
+                            f.unlink()
+                            self._conv_log("  [del] original removed")
+                    else:
+                        self._conv_log(f"[fail] {f.name}  exit={ret}")
+                        if output.exists():
+                            output.unlink()
+                        errors += 1
+
+                except Exception as exc:
+                    self._conv_log(f"[err]  {f.name}: {exc}")
+                    self._conv_current_proc = None
+                    errors += 1
+            else:
+                self._conv_log(f"[dry run] Would convert: {f.name}")
+
+        sep = "=" * 60
+        self._output_q.put(f"\n{sep}\n")
+        self._output_q.put(
+            f"Combined complete: {total} file(s)\n"
+            f"  Track Manager changes : {tm_changed}\n"
+            f"  Converted             : {converted}\n"
+            f"  Errors                : {errors}\n"
+        )
+        self.after(0, self._combined_on_done)
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
