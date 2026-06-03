@@ -31,6 +31,7 @@ Requirements:
   mkv_subdoctor.py in the same folder as this script
 """
 
+import concurrent.futures
 import contextlib
 import hashlib
 import json
@@ -275,11 +276,13 @@ class App(tk.Tk):
         self._custom_langs: set[str] = set()
 
         # Video Converter state
-        self._conv_files:        List[FileInfo]             = []
-        self._conv_converting:   bool                       = False
-        self._conv_stop_flag:    threading.Event            = threading.Event()
-        self._conv_log_q:        queue.Queue                = queue.Queue()
-        self._conv_current_proc: Optional[subprocess.Popen] = None
+        self._conv_files:         List[FileInfo]              = []
+        self._conv_converting:    bool                        = False
+        self._conv_stop_flag:     threading.Event             = threading.Event()
+        self._conv_log_q:         queue.Queue                 = queue.Queue()
+        self._conv_current_proc:  Optional[subprocess.Popen] = None   # combined workers
+        self._conv_current_procs: List[subprocess.Popen]     = []     # parallel worker
+        self._conv_procs_lock:    threading.Lock              = threading.Lock()
         self._ffmpeg  = self._find_exe("ffmpeg")
         self._ffprobe = self._find_exe("ffprobe")
         self._conv_probe_sem = threading.Semaphore(4)
@@ -346,6 +349,7 @@ class App(tk.Tk):
                     "conv_del_orig":        self._conv_del_orig_var.get(),
                     "conv_replace_orig":    self._conv_replace_orig_var.get(),
                     "conv_skip_processed":  self._conv_skip_processed_var.get(),
+                    "conv_parallel":        self._conv_parallel_var.get(),
                 })
 
             _CONFIG.write_text(json.dumps(prefs, indent=2), encoding="utf-8")
@@ -422,6 +426,7 @@ class App(tk.Tk):
         self._conv_del_orig_var.set(    prefs.get("conv_del_orig",       False))
         self._conv_replace_orig_var.set(prefs.get("conv_replace_orig",  False))
         self._conv_skip_processed_var.set(prefs.get("conv_skip_processed", False))
+        self._conv_parallel_var.set(    prefs.get("conv_parallel",       2))
 
         # Update preset description label
         p = PRESETS.get(prefs.get("conv_preset", "Shield Optimal"), PRESETS["Custom"])
@@ -1239,6 +1244,10 @@ class App(tk.Tk):
             vf, textvariable=self._conv_vcodec_var, width=W, state="readonly",
             values=["libx264  (H.264)",
                     "libx265  (H.265/HEVC)",
+                    "libsvtav1  (AV1 — CPU, slower)",
+                    "av1_nvenc  (AV1 — NVIDIA RTX 30/40)",
+                    "av1_qsv  (AV1 — Intel Arc / 12th gen+)",
+                    "av1_amf  (AV1 — AMD RX 7000+)",
                     "copy  (no re-encode)"])
         self._conv_vcodec_cb.grid(row=0, column=1, padx=6, pady=3, sticky="ew")
         self._conv_vcodec_cb.bind("<<ComboboxSelected>>", self._conv_normalise_vcodec)
@@ -1326,6 +1335,14 @@ class App(tk.Tk):
         self._conv_skip_processed_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(optf, text="Skip already processed files",
                         variable=self._conv_skip_processed_var).pack(anchor="w", padx=8, pady=2)
+
+        par_row = ttk.Frame(optf)
+        par_row.pack(fill="x", padx=8, pady=4)
+        ttk.Label(par_row, text="Parallel jobs:").pack(side="left")
+        self._conv_parallel_var = tk.IntVar(value=2)
+        ttk.Spinbox(par_row, from_=1, to=8, width=4,
+                    textvariable=self._conv_parallel_var).pack(side="left", padx=6)
+        ttk.Label(par_row, text="(4070 Ti sweet spot: 2–3)").pack(side="left")
 
         # Apply initial preset
         self._conv_apply_preset()
@@ -1960,12 +1977,23 @@ class App(tk.Tk):
 
     def _conv_stop(self):
         self._conv_stop_flag.set()
+        # Terminate all parallel worker processes
+        with self._conv_procs_lock:
+            for proc in list(self._conv_current_procs):
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
+        # Terminate combined-worker process (sequential, stored separately)
         if self._conv_current_proc:
             try:
                 self._conv_current_proc.terminate()
             except Exception:
                 pass
-        self._conv_log("Stop requested — finishing current file…")
+        n = len(self._conv_current_procs)
+        msg = (f"Stop requested — terminating {n} active job(s)…"
+               if n > 1 else "Stop requested — finishing active file…")
+        self._conv_log(msg)
         self._conv_stop_btn.configure(state="disabled")
 
     def _conv_on_done(self):
@@ -1980,30 +2008,43 @@ class App(tk.Tk):
         self._conv_overall_bar["value"] = done / total * 100 if total else 0
         self._conv_overall_lbl["text"]  = f"{done} / {total}"
 
-    # ── Video Converter: worker thread ────────────────────────────────────────
+    # ── Video Converter: worker thread (parallel) ─────────────────────────────
 
     def _conv_worker(self, files: List[FileInfo]):
         total          = len(files)
-        done           = 0
+        done_count     = [0]
+        done_lock      = threading.Lock()
         time_re        = re.compile(r"time=(\d+):(\d+):(\d+)\.(\d+)")
         no_change      = (self._conv_preset_var.get() == "No Change")
         skip_processed = self._conv_skip_processed_var.get()
         conv_hash      = self._compute_conv_hash()
+        n_parallel     = max(1, self._conv_parallel_var.get())
 
-        for info in files:
+        if n_parallel > 1:
+            self._conv_log(
+                f"[parallel] Running up to {n_parallel} concurrent job(s).")
+
+        def _inc_done():
+            with done_lock:
+                done_count[0] += 1
+                d = done_count[0]
+            self.after(0, self._conv_set_overall, d, total)
+
+        def _process_one(info: FileInfo):
             if self._conv_stop_flag.is_set():
                 info.status = "Cancelled"
                 self.after(0, self._conv_refresh_row, info)
-                continue
+                _inc_done()
+                return
 
             # No Change preset — skip conversion entirely
             if no_change:
                 info.status = "Skipped"
-                self._conv_log(f"[no-change] {info.path.name}  (conversion skipped by preset)")
+                self._conv_log(
+                    f"[no-change] {info.path.name}  (conversion skipped by preset)")
                 self.after(0, self._conv_refresh_row, info)
-                done += 1
-                self.after(0, self._conv_set_overall, done, total)
-                continue
+                _inc_done()
+                return
 
             # Skip if already processed with current settings
             if skip_processed and self._history_check(info.path, conv_hash):
@@ -2011,30 +2052,26 @@ class App(tk.Tk):
                 self._conv_log(
                     f"[skip] {info.path.name}  (already processed with current settings)")
                 self.after(0, self._conv_refresh_row, info)
-                done += 1
-                self.after(0, self._conv_set_overall, done, total)
-                continue
+                _inc_done()
+                return
 
-            # Skip compatible?
+            # Skip already-compatible files
             if self._conv_skip_compat_var.get() and info.is_plex_compatible:
                 info.status = "Skipped"
                 self._conv_log(f"[skip] {info.path.name}  (already compatible)")
                 self.after(0, self._conv_refresh_row, info)
-                done += 1
-                self.after(0, self._conv_set_overall, done, total)
-                continue
+                _inc_done()
+                return
 
             output = self._conv_output_path(info)
-
             if output.exists() and not self._conv_overwrite_var.get():
                 info.status = "Skipped"
                 self._conv_log(f"[skip] {info.path.name}  (output exists)")
                 self.after(0, self._conv_refresh_row, info)
-                done += 1
-                self.after(0, self._conv_set_overall, done, total)
-                continue
+                _inc_done()
+                return
 
-            # Capture pre-conversion stats for history (before file may be renamed/deleted)
+            # Capture pre-conversion stats for history
             pre_size, pre_mtime = 0, 0.0
             try:
                 _st = info.path.stat()
@@ -2045,22 +2082,21 @@ class App(tk.Tk):
             cmd = self._conv_build_cmd(info, output)
             self._conv_log(f"\n[start] {info.path.name}")
             self._conv_log(f"    →   {output}")
-
             info.status = "Converting"
             self.after(0, self._conv_refresh_row, info)
 
+            proc = None
             try:
-                self._conv_current_proc = subprocess.Popen(
-                    cmd,
-                    stderr=subprocess.PIPE,
-                    universal_newlines=True,
-                    encoding="utf-8",
-                    errors="replace",
+                proc = subprocess.Popen(
+                    cmd, stderr=subprocess.PIPE,
+                    universal_newlines=True, encoding="utf-8", errors="replace",
                 )
+                with self._conv_procs_lock:
+                    self._conv_current_procs.append(proc)
 
-                for line in self._conv_current_proc.stderr:
+                for line in proc.stderr:
                     if self._conv_stop_flag.is_set():
-                        self._conv_current_proc.terminate()
+                        proc.terminate()
                         break
                     m = time_re.search(line)
                     if m and info.duration > 0:
@@ -2072,8 +2108,12 @@ class App(tk.Tk):
                     elif "error" in line.lower() and "nonfatal" not in line.lower():
                         self._conv_log(f"    ! {line.rstrip()}")
 
-                ret = self._conv_current_proc.wait()
-                self._conv_current_proc = None
+                ret = proc.wait()
+                with self._conv_procs_lock:
+                    try:
+                        self._conv_current_procs.remove(proc)
+                    except ValueError:
+                        pass
 
                 if ret == 0 and not self._conv_stop_flag.is_set():
                     info.status = "Done"
@@ -2082,10 +2122,7 @@ class App(tk.Tk):
                     self._conv_log(
                         f"[done] {info.path.name}  "
                         f"{info.size_mb:.0f} MB → {out_mb:.0f} MB  ({ratio:.0f}%)")
-
-                    # Record history before any rename/delete changes the path
                     self._history_record_at(info.path, pre_size, pre_mtime, conv_hash)
-
                     if self._conv_replace_orig_var.get() and output.exists():
                         output = self._conv_do_replace_original(info, output)
                     elif self._conv_del_orig_var.get() and output.exists():
@@ -2100,12 +2137,19 @@ class App(tk.Tk):
             except Exception as exc:
                 info.status = "Error"
                 self._conv_log(f"[err]  {info.path.name}: {exc}")
-                self._conv_current_proc = None
+                if proc is not None:
+                    with self._conv_procs_lock:
+                        try:
+                            self._conv_current_procs.remove(proc)
+                        except ValueError:
+                            pass
 
-            done += 1
             self.after(0, self._conv_refresh_row, info,
                        "100%" if info.status == "Done" else "")
-            self.after(0, self._conv_set_overall, done, total)
+            _inc_done()
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=n_parallel) as pool:
+            list(pool.map(_process_one, files))
 
         counts = {s: sum(1 for f in files if f.status == s)
                   for s in ("Done", "Skipped", "Error", "Cancelled")}
@@ -2152,9 +2196,12 @@ class App(tk.Tk):
             cmd += ["-c:v", "copy"]
         else:
             hw_enc_map = {
-                "NVIDIA NVENC":    {"libx264": "h264_nvenc",  "libx265": "hevc_nvenc"},
-                "Intel Quick Sync":{"libx264": "h264_qsv",    "libx265": "hevc_qsv"},
-                "AMD AMF":         {"libx264": "h264_amf",    "libx265": "hevc_amf"},
+                "NVIDIA NVENC":    {"libx264": "h264_nvenc",  "libx265": "hevc_nvenc",
+                                    "libsvtav1": "av1_nvenc"},
+                "Intel Quick Sync":{"libx264": "h264_qsv",    "libx265": "hevc_qsv",
+                                    "libsvtav1": "av1_qsv"},
+                "AMD AMF":         {"libx264": "h264_amf",    "libx265": "hevc_amf",
+                                    "libsvtav1": "av1_amf"},
             }
             final_vcodec = hw_enc_map.get(hw, {}).get(raw_vc, raw_vc)
             cmd += ["-c:v", final_vcodec]
@@ -2163,6 +2210,9 @@ class App(tk.Tk):
             spd = self._conv_enc_preset_var.get()
             if final_vcodec in ("libx264", "libx265"):
                 cmd += ["-crf", crf, "-preset", spd]
+            elif final_vcodec == "libsvtav1":
+                # SVT-AV1 uses integer preset 0 (slowest) – 13 (fastest); 6 = balanced
+                cmd += ["-crf", crf, "-preset", "6"]
             elif "nvenc" in final_vcodec:
                 cmd += ["-rc", "vbr", "-cq", crf, "-preset", "p4"]
             elif "qsv" in final_vcodec:
@@ -2171,15 +2221,16 @@ class App(tk.Tk):
                 cmd += ["-rc", "cqp", "-qp_i", crf, "-qp_p", crf]
 
         is_hevc = final_vcodec in ("libx265", "hevc_nvenc", "hevc_qsv", "hevc_amf")
+        is_av1  = "av1" in final_vcodec   # covers libsvtav1, av1_nvenc, av1_qsv, av1_amf
 
-        # Resolution downscale / H.265 even-dimension enforcement
+        # Resolution downscale / even-dimension enforcement (HEVC and AV1 require even dims)
         res = self._conv_resolution_var.get()
         if res != "original":
             w, h = res.split("x")
             vf   = (f"scale={w}:{h}:force_original_aspect_ratio=decrease"
                     ":flags=lanczos,pad=ceil(iw/2)*2:ceil(ih/2)*2")
             cmd += ["-vf", vf]
-        elif is_hevc:
+        elif is_hevc or is_av1:
             cmd += ["-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2"]
 
         # Audio codec
