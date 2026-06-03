@@ -1983,8 +1983,9 @@ class App(tk.Tk):
         self._combined_btn.configure(state="disabled")
         self._conv_combined_btn.configure(state="disabled")
         self._start_btn.configure(state="disabled")
+        n_parallel = max(1, self._conv_parallel_var.get())   # read on main thread
         threading.Thread(
-            target=self._conv_worker, args=(pending,), daemon=True).start()
+            target=self._conv_worker, args=(pending, n_parallel), daemon=True).start()
 
     def _conv_stop(self):
         self._conv_stop_flag.set()
@@ -2049,8 +2050,9 @@ class App(tk.Tk):
             self._conv_stop_btn.configure(state="normal")
             n = len(pending)
             self._conv_log(f"▶  Resuming — {n} file(s) remaining.")
+            n_parallel = max(1, self._conv_parallel_var.get())   # read on main thread
             threading.Thread(
-                target=self._conv_worker, args=(pending,), daemon=True).start()
+                target=self._conv_worker, args=(pending, n_parallel), daemon=True).start()
 
     def _conv_on_pause(self):
         """Called from the worker thread (via after()) once all active jobs have wound down."""
@@ -2064,7 +2066,7 @@ class App(tk.Tk):
 
     # ── Video Converter: worker thread (parallel) ─────────────────────────────
 
-    def _conv_worker(self, files: List[FileInfo]):
+    def _conv_worker(self, files: List[FileInfo], n_parallel: int = 1):
         total          = len(files)
         done_count     = [0]
         done_lock      = threading.Lock()
@@ -2072,7 +2074,6 @@ class App(tk.Tk):
         no_change      = (self._conv_preset_var.get() == "No Change")
         skip_processed = self._conv_skip_processed_var.get()
         conv_hash      = self._compute_conv_hash()
-        n_parallel     = max(1, self._conv_parallel_var.get())
 
         if n_parallel > 1:
             self._conv_log(
@@ -2647,11 +2648,12 @@ class App(tk.Tk):
         self._conv_stop_btn.configure(state="normal")     # conv Stop halts ffmpeg
         self._conv_combined_btn.configure(state="disabled")
 
+        n_parallel = max(1, self._conv_parallel_var.get())   # read on main thread
         threading.Thread(
             target=self._combined_worker_conv,
             args=(pending, keep_langs, remaps, dry_run, no_log,
                   spell_check, manage_audio, audio_langs, log_dir,
-                  preferred_sub_lang, preferred_audio_lang),
+                  preferred_sub_lang, preferred_audio_lang, n_parallel),
             daemon=True,
         ).start()
 
@@ -2669,10 +2671,13 @@ class App(tk.Tk):
     def _combined_worker_conv(self, files: List[FileInfo],
                                keep_langs, remaps, dry_run, no_log,
                                spell_check, manage_audio, audio_langs, log_dir,
-                               preferred_sub_lang=None, preferred_audio_lang=None):
+                               preferred_sub_lang=None, preferred_audio_lang=None,
+                               n_parallel: int = 1):
         """Pipeline: one TM thread feeds a queue; N encoder threads drain it.
         Encoding starts as soon as the first file clears TM — no waiting for all
         5000+ files to be TM-processed before a single encode begins.
+        n_parallel must be passed from the main thread (tkinter vars are not
+        thread-safe to read from background threads).
         """
         if no_log:
             core._LOG_DIR = None
@@ -2680,7 +2685,6 @@ class App(tk.Tk):
             core._LOG_DIR = Path(log_dir)
 
         total          = len(files)
-        n_parallel     = max(1, self._conv_parallel_var.get())
         stream         = _QueueStream(self._output_q)
         skip_processed = self._tm_skip_processed_var.get()
         tm_hash        = self._compute_tm_hash(keep_langs, remaps, manage_audio,
@@ -2886,6 +2890,8 @@ class App(tk.Tk):
                 _encode_one(info)
 
         # ── Launch pipeline ───────────────────────────────────────────────────
+        self._conv_log(
+            f"[pipeline] Starting TM thread + {n_parallel} encoder thread(s).")
         tm_thread = threading.Thread(target=_tm_producer, daemon=True)
         enc_threads = [
             threading.Thread(target=_encoder_consumer, daemon=True)
