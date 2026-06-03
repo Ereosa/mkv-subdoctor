@@ -1997,8 +1997,9 @@ class App(tk.Tk):
         self._conv_combined_btn.configure(state="disabled")
         self._start_btn.configure(state="disabled")
         n_parallel = max(1, self._conv_parallel_var.get())   # read on main thread
+        s = self._conv_read_settings()                       # read on main thread
         threading.Thread(
-            target=self._conv_worker, args=(pending, n_parallel), daemon=True).start()
+            target=self._conv_worker, args=(pending, n_parallel, s), daemon=True).start()
 
     def _conv_stop(self):
         self._conv_stop_flag.set()
@@ -2064,8 +2065,9 @@ class App(tk.Tk):
             n = len(pending)
             self._conv_log(f"▶  Resuming — {n} file(s) remaining.")
             n_parallel = max(1, self._conv_parallel_var.get())   # read on main thread
+            s = self._conv_read_settings()                       # read on main thread
             threading.Thread(
-                target=self._conv_worker, args=(pending, n_parallel), daemon=True).start()
+                target=self._conv_worker, args=(pending, n_parallel, s), daemon=True).start()
 
     def _conv_on_pause(self):
         """Called from the worker thread (via after()) once all active jobs have wound down."""
@@ -2079,14 +2081,16 @@ class App(tk.Tk):
 
     # ── Video Converter: worker thread (parallel) ─────────────────────────────
 
-    def _conv_worker(self, files: List[FileInfo], n_parallel: int = 1):
+    def _conv_worker(self, files: List[FileInfo], n_parallel: int = 1, s: dict = None):
+        if s is None:
+            s = {}
         total          = len(files)
         done_count     = [0]
         done_lock      = threading.Lock()
         time_re        = re.compile(r"time=(\d+):(\d+):(\d+)\.(\d+)")
-        no_change      = (self._conv_preset_var.get() == "No Change")
-        skip_processed = self._conv_skip_processed_var.get()
-        conv_hash      = self._compute_conv_hash()
+        no_change      = s.get("no_change", False)
+        skip_processed = s.get("skip_processed", False)
+        conv_hash      = s.get("conv_hash", "")
 
         if n_parallel > 1:
             self._conv_log(
@@ -2129,15 +2133,17 @@ class App(tk.Tk):
                 return
 
             # Skip already-compatible files
-            if self._conv_skip_compat_var.get() and info.is_plex_compatible:
+            if s.get("skip_compat") and info.is_plex_compatible:
                 info.status = "Skipped"
-                self._conv_log(f"[skip] {info.path.name}  (already compatible)")
+                self._conv_log(
+                    f"[skip] {info.path.name}  (already compatible:"
+                    f" {info.video_codec}/{info.audio_codec})")
                 self.after(0, self._conv_refresh_row, info)
                 _inc_done()
                 return
 
-            output = self._conv_output_path(info)
-            if output.exists() and not self._conv_overwrite_var.get():
+            output = self._conv_output_path(info, s)
+            if output.exists() and not s.get("overwrite"):
                 info.status = "Skipped"
                 self._conv_log(f"[skip] {info.path.name}  (output exists)")
                 self.after(0, self._conv_refresh_row, info)
@@ -2152,8 +2158,10 @@ class App(tk.Tk):
             except OSError:
                 pass
 
-            cmd = self._conv_build_cmd(info, output)
-            self._conv_log(f"\n[start] {info.path.name}")
+            cmd = self._conv_build_cmd(info, output, s)
+            self._conv_log(
+                f"\n[start] {info.path.name}"
+                f"  [{info.video_codec}/{info.audio_codec}]")
             self._conv_log(f"    →   {output}")
             info.status = "Converting"
             self.after(0, self._conv_refresh_row, info)
@@ -2173,8 +2181,8 @@ class App(tk.Tk):
                         break
                     m = time_re.search(line)
                     if m and info.duration > 0:
-                        h, mn, s, cs = (int(m.group(i)) for i in range(1, 5))
-                        elapsed = h * 3600 + mn * 60 + s + cs / 100
+                        h, mn, ss, cs = (int(m.group(i)) for i in range(1, 5))
+                        elapsed = h * 3600 + mn * 60 + ss + cs / 100
                         pct     = min(100.0, elapsed / info.duration * 100)
                         info.progress = pct
                         self.after(0, self._conv_refresh_row, info, f"{pct:.0f}%")
@@ -2197,9 +2205,9 @@ class App(tk.Tk):
                         f"[done] {info.path.name}  "
                         f"{info.size_mb:.0f} MB → {out_mb:.0f} MB  ({ratio:.0f}%)")
                     self._history_record_at(info.path, pre_size, pre_mtime, conv_hash)
-                    if self._conv_replace_orig_var.get() and output.exists():
+                    if s.get("replace_orig") and output.exists():
                         output = self._conv_do_replace_original(info, output)
-                    elif self._conv_del_orig_var.get() and output.exists():
+                    elif s.get("del_orig") and output.exists():
                         info.path.unlink()
                         self._conv_log("  [del] original removed")
                 elif self._conv_pause_flag.is_set():
@@ -2251,22 +2259,52 @@ class App(tk.Tk):
 
     # ── Video Converter: ffmpeg command builder ───────────────────────────────
 
-    def _conv_output_path(self, info: FileInfo) -> Path:
-        ext     = self._conv_container_var.get()
-        out_s   = self._conv_output_var.get()
+    def _conv_read_settings(self) -> dict:
+        """Snapshot every converter setting as plain Python values.
+        MUST be called on the main thread — tkinter vars are not thread-safe.
+        Includes a pre-computed conv_hash so workers never touch tkinter."""
+        s = {
+            "preset":         self._conv_preset_var.get(),
+            "no_change":      self._conv_preset_var.get() == "No Change",
+            "output_dir":     self._conv_output_var.get(),
+            "container":      self._conv_container_var.get(),
+            "vcodec":         self._conv_vcodec_var.get().split("  ")[0],
+            "crf":            str(self._conv_crf_var.get()),
+            "enc_preset":     self._conv_enc_preset_var.get(),
+            "resolution":     self._conv_resolution_var.get(),
+            "hwaccel":        self._conv_hwaccel_var.get(),
+            "acodec":         self._conv_acodec_var.get().split("  ")[0],
+            "abitrate":       self._conv_abitrate_var.get(),
+            "subtitle":       self._conv_subtitle_var.get(),
+            "skip_compat":    self._conv_skip_compat_var.get(),
+            "overwrite":      self._conv_overwrite_var.get(),
+            "del_orig":       self._conv_del_orig_var.get(),
+            "replace_orig":   self._conv_replace_orig_var.get(),
+            "skip_processed": self._conv_skip_processed_var.get(),
+        }
+        # Pre-compute hash from encode-relevant keys
+        hash_keys = ("preset", "container", "vcodec", "crf", "enc_preset",
+                     "resolution", "hwaccel", "acodec", "abitrate", "subtitle")
+        s["conv_hash"] = hashlib.md5(
+            json.dumps({k: s[k] for k in hash_keys}, sort_keys=True).encode()
+        ).hexdigest()[:16]
+        return s
+
+    def _conv_output_path(self, info: FileInfo, s: dict) -> Path:
+        ext     = s["container"]
+        out_s   = s["output_dir"]
         out_dir = info.path.parent if out_s == "Same as source" else Path(out_s)
         out_dir.mkdir(parents=True, exist_ok=True)
-
         stem = info.path.stem
         if info.path.parent == out_dir:
             stem += "_plex"
         return out_dir / f"{stem}.{ext}"
 
-    def _conv_build_cmd(self, info: FileInfo, output: Path) -> List[str]:
+    def _conv_build_cmd(self, info: FileInfo, output: Path, s: dict) -> List[str]:
         cmd: List[str] = [self._ffmpeg, "-hide_banner", "-loglevel", "info"]
 
         # Hardware-accelerated decode
-        hw = self._conv_hwaccel_var.get()
+        hw = s["hwaccel"]
         if "NVIDIA" in hw:
             # -hwaccel cuda uses NVDEC for fast GPU decode.
             # Omitting -hwaccel_output_format cuda so decoded frames land in
@@ -2278,10 +2316,10 @@ class App(tk.Tk):
             cmd += ["-hwaccel", "d3d11va"]
 
         cmd += ["-i", str(info.path)]
-        cmd += ["-y" if self._conv_overwrite_var.get() else "-n"]
+        cmd += ["-y" if s["overwrite"] else "-n"]
 
         # Video codec
-        raw_vc      = self._conv_vcodec_var.get().split("  ")[0]
+        raw_vc       = s["vcodec"]
         final_vcodec = raw_vc
 
         if raw_vc == "copy":
@@ -2298,12 +2336,11 @@ class App(tk.Tk):
             final_vcodec = hw_enc_map.get(hw, {}).get(raw_vc, raw_vc)
             cmd += ["-c:v", final_vcodec]
 
-            crf = str(self._conv_crf_var.get())
-            spd = self._conv_enc_preset_var.get()
+            crf = s["crf"]
+            spd = s["enc_preset"]
             if final_vcodec in ("libx264", "libx265"):
                 cmd += ["-crf", crf, "-preset", spd]
             elif final_vcodec == "libsvtav1":
-                # SVT-AV1 uses integer preset 0 (slowest) – 13 (fastest); 6 = balanced
                 cmd += ["-crf", crf, "-preset", "6"]
             elif "nvenc" in final_vcodec:
                 cmd += ["-rc", "vbr", "-cq", crf, "-preset", "p4"]
@@ -2313,10 +2350,10 @@ class App(tk.Tk):
                 cmd += ["-rc", "cqp", "-qp_i", crf, "-qp_p", crf]
 
         is_hevc = final_vcodec in ("libx265", "hevc_nvenc", "hevc_qsv", "hevc_amf")
-        is_av1  = "av1" in final_vcodec   # covers libsvtav1, av1_nvenc, av1_qsv, av1_amf
+        is_av1  = "av1" in final_vcodec
 
-        # Resolution downscale / even-dimension enforcement (HEVC and AV1 require even dims)
-        res = self._conv_resolution_var.get()
+        # Resolution downscale / even-dimension enforcement
+        res = s["resolution"]
         if res != "original":
             w, h = res.split("x")
             vf   = (f"scale={w}:{h}:force_original_aspect_ratio=decrease"
@@ -2326,18 +2363,17 @@ class App(tk.Tk):
             cmd += ["-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2"]
 
         # Audio codec
-        raw_ac = self._conv_acodec_var.get().split("  ")[0]
+        raw_ac = s["acodec"]
         if raw_ac == "copy":
             cmd += ["-c:a", "copy"]
         else:
-            cmd += ["-c:a", raw_ac, "-b:a", self._conv_abitrate_var.get()]
+            cmd += ["-c:a", raw_ac, "-b:a", s["abitrate"]]
 
         # Subtitles
-        if self._conv_subtitle_var.get() == "strip":
+        if s["subtitle"] == "strip":
             cmd += ["-sn"]
         else:
-            container = self._conv_container_var.get()
-            if container == "mp4":
+            if s["container"] == "mp4":
                 cmd += ["-c:s", "mov_text"]
             else:
                 cmd += ["-c:s", "copy"]
@@ -2406,11 +2442,12 @@ class App(tk.Tk):
         self._conv_pause_btn.configure(state="disabled")
         self._conv_stop_btn.configure(state="disabled")
 
+        _s = self._conv_read_settings()   # snapshot on main thread
         self._worker = threading.Thread(
             target=self._combined_worker,
             args=(paths, keep_langs, remaps, dry_run, recursive, no_log,
                   spell_check, manage_audio, audio_langs, log_dir,
-                  preferred_sub_lang, preferred_audio_lang),
+                  preferred_sub_lang, preferred_audio_lang, _s),
             daemon=True,
         )
         self._worker.start()
@@ -2433,7 +2470,7 @@ class App(tk.Tk):
 
     def _combined_worker(self, paths, keep_langs, remaps, dry_run, recursive, no_log,
                          spell_check, manage_audio, audio_langs, log_dir,
-                         preferred_sub_lang=None, preferred_audio_lang=None):
+                         preferred_sub_lang=None, preferred_audio_lang=None, s=None):
         if no_log:
             core._LOG_DIR = None
         else:
@@ -2468,6 +2505,8 @@ class App(tk.Tk):
                 "conversion step will still run]\n")
         self._output_q.put("\n")
 
+        if s is None:
+            s = {}
         tm_changed     = 0
         converted      = 0
         errors         = 0
@@ -2477,7 +2516,7 @@ class App(tk.Tk):
         tm_hash        = self._compute_tm_hash(keep_langs, remaps, manage_audio,
                                                audio_langs, preferred_sub_lang,
                                                preferred_audio_lang, spell_check)
-        conv_hash      = self._compute_conv_hash()
+        conv_hash      = s.get("conv_hash", "")
 
         for idx, f in enumerate(mkv_files):
             if core._stop_event.is_set():
@@ -2527,12 +2566,12 @@ class App(tk.Tk):
                 break
 
             # ── Step 2: Video Converter ───────────────────────────────────
-            if self._conv_preset_var.get() == "No Change":
+            if s.get("no_change"):
                 self._conv_log(f"[no-change] {f.name}  (conversion skipped by preset)")
                 continue
 
             # Skip conv step if already processed with current conv settings
-            if self._conv_skip_processed_var.get() and self._history_check(f, conv_hash):
+            if s.get("skip_processed") and self._history_check(f, conv_hash):
                 self._conv_log(
                     f"[skip] {f.name}  (already processed with current conv settings)")
                 continue
@@ -2542,8 +2581,8 @@ class App(tk.Tk):
             self._conv_probe_sync(info)   # fills duration for progress %
 
             if not dry_run:
-                output = self._conv_output_path(info)
-                cmd    = self._conv_build_cmd(info, output)
+                output = self._conv_output_path(info, s)
+                cmd    = self._conv_build_cmd(info, output, s)
                 self._conv_log(f"\n[Combined {file_num}] {f.name}")
                 self._conv_log(f"    →  {output}")
 
@@ -2568,8 +2607,8 @@ class App(tk.Tk):
                             break
                         m = time_re.search(line)
                         if m and info.duration > 0:
-                            h, mn, s, cs = (int(m.group(i)) for i in range(1, 5))
-                            elapsed = h * 3600 + mn * 60 + s + cs / 100
+                            h, mn, ss, cs = (int(m.group(i)) for i in range(1, 5))
+                            elapsed = h * 3600 + mn * 60 + ss + cs / 100
                             pct_c   = min(100.0, elapsed / info.duration * 100)
                             self._conv_log(f"  {f.name}  {pct_c:.0f}%")
                         elif "error" in line.lower() and "nonfatal" not in line.lower():
@@ -2586,9 +2625,9 @@ class App(tk.Tk):
                             f"{info.size_mb:.0f} MB → {out_mb:.0f} MB  ({ratio:.0f}%)")
                         converted += 1
                         self._history_record_at(f, pre_size, pre_mtime, conv_hash)
-                        if self._conv_replace_orig_var.get() and output.exists():
+                        if s.get("replace_orig") and output.exists():
                             self._conv_do_replace_original(info, output)
-                        elif self._conv_del_orig_var.get() and output.exists():
+                        elif s.get("del_orig") and output.exists():
                             f.unlink()
                             self._conv_log("  [del] original removed")
                     else:
@@ -2662,11 +2701,12 @@ class App(tk.Tk):
         self._conv_combined_btn.configure(state="disabled")
 
         n_parallel = max(1, self._conv_parallel_var.get())   # read on main thread
+        s          = self._conv_read_settings()               # read on main thread
         threading.Thread(
             target=self._combined_worker_conv,
             args=(pending, keep_langs, remaps, dry_run, no_log,
                   spell_check, manage_audio, audio_langs, log_dir,
-                  preferred_sub_lang, preferred_audio_lang, n_parallel),
+                  preferred_sub_lang, preferred_audio_lang, n_parallel, s),
             daemon=True,
         ).start()
 
@@ -2685,7 +2725,7 @@ class App(tk.Tk):
                                keep_langs, remaps, dry_run, no_log,
                                spell_check, manage_audio, audio_langs, log_dir,
                                preferred_sub_lang=None, preferred_audio_lang=None,
-                               n_parallel: int = 1):
+                               n_parallel: int = 1, s: dict = None):
         """Pipeline: one TM thread feeds a queue; N encoder threads drain it.
         Encoding starts as soon as the first file clears TM — no waiting for all
         5000+ files to be TM-processed before a single encode begins.
@@ -2699,12 +2739,14 @@ class App(tk.Tk):
 
         total          = len(files)
         stream         = _QueueStream(self._output_q)
+        if s is None:
+            s = {}
         skip_processed = self._tm_skip_processed_var.get()
         tm_hash        = self._compute_tm_hash(keep_langs, remaps, manage_audio,
                                                audio_langs, preferred_sub_lang,
                                                preferred_audio_lang, spell_check)
-        conv_hash      = self._compute_conv_hash()
-        no_change      = (self._conv_preset_var.get() == "No Change")
+        conv_hash      = s.get("conv_hash", "")
+        no_change      = s.get("no_change", False)
         time_re        = re.compile(r"time=(\d+):(\d+):(\d+)\.(\d+)")
 
         self._conv_log(
@@ -2792,7 +2834,7 @@ class App(tk.Tk):
                 _inc_done()
                 return
 
-            if self._conv_skip_processed_var.get() \
+            if s.get("skip_processed") \
                     and self._history_check(info.path, conv_hash):
                 info.status = "Skipped"
                 self._conv_log(
@@ -2804,15 +2846,17 @@ class App(tk.Tk):
             if info.duration == 0:
                 self._conv_probe_sync(info)
 
-            if self._conv_skip_compat_var.get() and info.is_plex_compatible:
+            if s.get("skip_compat") and info.is_plex_compatible:
                 info.status = "Skipped"
-                self._conv_log(f"[skip] {info.path.name}  (already compatible)")
+                self._conv_log(
+                    f"[skip] {info.path.name}  (already compatible:"
+                    f" {info.video_codec}/{info.audio_codec})")
                 self.after(0, self._conv_refresh_row, info)
                 _inc_done()
                 return
 
-            output = self._conv_output_path(info)
-            if output.exists() and not self._conv_overwrite_var.get():
+            output = self._conv_output_path(info, s)
+            if output.exists() and not s.get("overwrite"):
                 info.status = "Skipped"
                 self._conv_log(f"[skip] {info.path.name}  (output exists)")
                 self.after(0, self._conv_refresh_row, info)
@@ -2826,8 +2870,10 @@ class App(tk.Tk):
             except OSError:
                 pass
 
-            cmd = self._conv_build_cmd(info, output)
-            self._conv_log(f"\n[start] {info.path.name}")
+            cmd = self._conv_build_cmd(info, output, s)
+            self._conv_log(
+                f"\n[start] {info.path.name}"
+                f"  [{info.video_codec}/{info.audio_codec}]")
             self._conv_log(f"    →  {output}")
             info.status = "Converting"
             self.after(0, self._conv_refresh_row, info)
@@ -2847,8 +2893,8 @@ class App(tk.Tk):
                         break
                     m = time_re.search(line)
                     if m and info.duration > 0:
-                        h, mn, s, cs = (int(m.group(i)) for i in range(1, 5))
-                        elapsed = h * 3600 + mn * 60 + s + cs / 100
+                        h, mn, ss, cs = (int(m.group(i)) for i in range(1, 5))
+                        elapsed = h * 3600 + mn * 60 + ss + cs / 100
                         pct_c   = min(100.0, elapsed / info.duration * 100)
                         info.progress = pct_c
                         self.after(0, self._conv_refresh_row, info, f"{pct_c:.0f}%")
@@ -2870,9 +2916,9 @@ class App(tk.Tk):
                         f"[done] {info.path.name}  "
                         f"{info.size_mb:.0f} MB → {out_mb:.0f} MB  ({ratio:.0f}%)")
                     self._history_record_at(info.path, pre_size, pre_mtime, conv_hash)
-                    if self._conv_replace_orig_var.get() and output.exists():
+                    if s.get("replace_orig") and output.exists():
                         self._conv_do_replace_original(info, output)
-                    elif self._conv_del_orig_var.get() and output.exists():
+                    elif s.get("del_orig") and output.exists():
                         info.path.unlink()
                         self._conv_log("  [del] original removed")
                 else:
