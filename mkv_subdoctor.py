@@ -1205,16 +1205,42 @@ def process_mkv(mkv_path: str, dry_run: bool = False,
                         os.remove(out_path)
                     return False
 
-        try:
-            os.rename(out_path, mkv_path)
-            os.remove(bak)
-        except OSError as e:
-            print(f"  ERROR replacing file: {e}")
-            if os.path.exists(bak) and not os.path.exists(mkv_path):
-                os.rename(bak, mkv_path)
-            if os.path.exists(out_path):
-                os.remove(out_path)
-            return False
+        # Second rename: new file → original name.  Also retried — Plex often
+        # grabs the freshly-created .new.mkv for a metadata scan the instant the
+        # original disappears, briefly locking it (WinError 32).
+        placed = False
+        for attempt in range(_RENAME_RETRIES):
+            try:
+                os.rename(out_path, mkv_path)
+                placed = True
+                break
+            except OSError as e:
+                if attempt < _RENAME_RETRIES - 1:
+                    print(f"  New file in use — waiting {_RENAME_DELAY}s then retrying "
+                          f"({attempt + 1}/{_RENAME_RETRIES - 1})…")
+                    time.sleep(_RENAME_DELAY)
+                else:
+                    print(f"  ERROR replacing file after {_RENAME_RETRIES} attempts: {e}")
+                    # Restore the original from the backup so nothing is lost
+                    if os.path.exists(bak) and not os.path.exists(mkv_path):
+                        try:
+                            os.rename(bak, mkv_path)
+                            print("  Restored original from backup.")
+                        except OSError:
+                            print(f"  WARNING: original left at {bak}")
+                    if os.path.exists(out_path):
+                        try:
+                            os.remove(out_path)
+                        except OSError:
+                            pass
+                    return False
+
+        if placed:
+            try:
+                os.remove(bak)
+            except OSError:
+                # Backup removal failing is non-fatal; the new file is in place
+                print(f"  Note: could not remove backup {bak}")
 
         kept  = len(ordered)
         total = len(sub_tracks)
