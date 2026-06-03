@@ -62,8 +62,25 @@ _BMC_URL = "https://buymeacoffee.com/mkvsubdoctor"
 
 _SCRIPT_DIR = Path(__file__).parent
 _BMC_IMG    = _SCRIPT_DIR / "bmc-button.png"
-_CONFIG     = _SCRIPT_DIR / "mkv_subdoctor_config.json"
-_HISTORY    = _SCRIPT_DIR / "mkv_subdoctor_history.json"
+
+# ── Config / history stored in %APPDATA% so both copies of the script
+#    (D:\Claude Projects\ and P:\Maint\) always share the same settings ──────
+_APP_DATA   = Path(os.environ.get("APPDATA", Path.home())) / "MKVSubDoctor"
+_APP_DATA.mkdir(parents=True, exist_ok=True)
+_CONFIG     = _APP_DATA / "config.json"
+_HISTORY    = _APP_DATA / "history.json"
+
+# One-time migration: pull config from script dir if the shared one is absent
+for _old in (_SCRIPT_DIR / "mkv_subdoctor_config.json",
+             _SCRIPT_DIR / "mkv_subdoctor_history.json"):
+    _new = _APP_DATA / ("config.json" if "config" in _old.name else "history.json")
+    if _old.exists() and not _new.exists():
+        try:
+            import shutil as _shutil
+            _shutil.copy2(_old, _new)
+        except Exception:
+            pass
+
 sys.path.insert(0, str(_SCRIPT_DIR))
 
 try:
