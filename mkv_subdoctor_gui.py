@@ -570,47 +570,93 @@ class App(tk.Tk):
             self._conv_log_count_lbl.configure(
                 text=f"({len(self._log_completed)} files)")
 
-    def _import_completed_log(self):
-        """Parse one or more log files for '[done] <filename>' lines and add those
-        filenames to the skip set.  Survives setting changes (CPU→GPU etc.) because
-        it matches on filename, not on the options hash."""
-        paths = filedialog.askopenfilenames(
-            title="Select previous run log file(s)",
-            filetypes=[("Log / text files", "*.log *.txt"), ("All files", "*.*")],
-        )
-        if not paths:
-            return
-        # Match: [done] <filename>   (filename runs until the double-space stats block)
+    def _parse_log_for_filenames(self, text: str) -> set:
+        """Extract completed-file basenames from a log.  Handles two formats:
+          1. Video Converter text logs:   [done] <filename>  ...
+          2. Track Manager JSON-lines:    {"file": "...\\path\\name.mkv", ...}
+             (only non-dry-run entries count as completed)"""
+        names: set = set()
         done_re = re.compile(r"\[done\]\s+(.+?)(?:\s{2,}\d|\s*$)")
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            if line.startswith("{"):
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+                f = obj.get("file")
+                if f and not obj.get("dry_run", False):
+                    names.add(Path(f).name)
+            elif "[done]" in line:
+                m = done_re.search(line)
+                if m and m.group(1).strip():
+                    names.add(m.group(1).strip())
+        return names
+
+    def _import_completed_log(self):
+        """Import completed filenames from previous-run log file(s) or a whole folder.
+        Matches on filename, so it survives setting changes (CPU→GPU etc.)."""
+        choice = messagebox.askyesnocancel(
+            "Import Logs",
+            "Import an entire folder of logs?\n\n"
+            "Yes  = pick a folder (all *.log files inside)\n"
+            "No   = pick individual log file(s)\n"
+            "Cancel = abort")
+        if choice is None:
+            return
+
+        files: list = []
+        if choice:   # folder
+            folder = filedialog.askdirectory(title="Select folder containing logs")
+            if not folder:
+                return
+            files = [str(p) for p in Path(folder).rglob("*.log")]
+            files += [str(p) for p in Path(folder).rglob("*.txt")]
+        else:        # individual files
+            files = list(filedialog.askopenfilenames(
+                title="Select previous run log file(s)",
+                filetypes=[("Log / text files", "*.log *.txt"), ("All files", "*.*")]))
+
+        if not files:
+            return
+
         added = 0
-        for p in paths:
+        scanned = 0
+        for p in files:
             try:
                 text = Path(p).read_text(encoding="utf-8", errors="replace")
             except Exception as e:
                 self._conv_log(f"[log-import] Could not read {p}: {e}")
                 continue
-            for line in text.splitlines():
-                m = done_re.search(line)
-                if m:
-                    name = m.group(1).strip()
-                    if name and name not in self._log_completed:
-                        self._log_completed.add(name)
-                        added += 1
+            scanned += 1
+            for name in self._parse_log_for_filenames(text):
+                if name not in self._log_completed:
+                    self._log_completed.add(name)
+                    added += 1
+
         self._save_completed_log()
         self._update_log_count_label()
         self._conv_log(
-            f"[log-import] Added {added} completed filename(s).  "
+            f"[log-import] Scanned {scanned} log(s); added {added} filename(s).  "
             f"Total tracked: {len(self._log_completed)}.")
         if added:
             messagebox.showinfo(
-                "Log Imported",
+                "Logs Imported",
+                f"Scanned {scanned} log file(s).\n"
                 f"Added {added} completed file(s) to the skip list.\n"
                 f"Total tracked: {len(self._log_completed)}.\n\n"
-                "Enable 'Skip files completed in imported logs' to use them.")
+                "Enable 'Skip files completed in imported logs' to use them.\n\n"
+                "Note: these mark files as completed by name.  The "
+                "'Skip already compatible files' option is a good safety net "
+                "in case any listed file wasn't actually finished.")
         else:
             messagebox.showinfo(
-                "Log Imported",
-                "No new '[done]' entries found in the selected file(s).")
+                "Logs Imported",
+                f"Scanned {scanned} log file(s) but found no completed entries.\n\n"
+                "Supported: Video Converter '[done]' lines and Track Manager "
+                "JSON logs (the \"file\" field).")
 
     def _clear_completed_log(self):
         self._log_completed.clear()
