@@ -279,6 +279,8 @@ class App(tk.Tk):
         self._conv_files:         List[FileInfo]              = []
         self._conv_converting:    bool                        = False
         self._conv_stop_flag:     threading.Event             = threading.Event()
+        self._conv_pause_flag:    threading.Event             = threading.Event()
+        self._conv_paused:        bool                        = False
         self._conv_log_q:         queue.Queue                 = queue.Queue()
         self._conv_current_proc:  Optional[subprocess.Popen] = None   # combined workers
         self._conv_current_procs: List[subprocess.Popen]     = []     # parallel worker
@@ -1102,6 +1104,12 @@ class App(tk.Tk):
             command=self._conv_stop, state="disabled",
         )
         self._conv_stop_btn.pack(side="right")
+
+        self._conv_pause_btn = ttk.Button(
+            bar, text="⏸  Pause",
+            command=self._conv_pause_toggle, state="disabled",
+        )
+        self._conv_pause_btn.pack(side="right", padx=(0, 6))
 
         self._conv_start_btn = ttk.Button(
             bar, text="▶  Start Conversion", style="Accent.TButton",
@@ -1967,7 +1975,10 @@ class App(tk.Tk):
 
         self._conv_converting = True
         self._conv_stop_flag.clear()
+        self._conv_pause_flag.clear()
+        self._conv_paused = False
         self._conv_start_btn.configure(state="disabled")
+        self._conv_pause_btn.configure(text="⏸  Pause", state="normal")
         self._conv_stop_btn.configure(state="normal")
         self._combined_btn.configure(state="disabled")
         self._conv_combined_btn.configure(state="disabled")
@@ -1977,6 +1988,9 @@ class App(tk.Tk):
 
     def _conv_stop(self):
         self._conv_stop_flag.set()
+        self._conv_pause_flag.clear()   # stop overrides any pending pause
+        self._conv_paused = False
+        self._conv_pause_btn.configure(text="⏸  Pause", state="disabled")
         # Terminate all parallel worker processes
         with self._conv_procs_lock:
             for proc in list(self._conv_current_procs):
@@ -1998,11 +2012,51 @@ class App(tk.Tk):
 
     def _conv_on_done(self):
         self._conv_converting = False
+        self._conv_paused = False
         self._conv_start_btn.configure(state="normal")
+        self._conv_pause_btn.configure(text="⏸  Pause", state="disabled")
         self._conv_stop_btn.configure(state="disabled")
         self._combined_btn.configure(state="normal")
         self._conv_combined_btn.configure(state="normal")
         self._start_btn.configure(state="normal")
+
+    def _conv_pause_toggle(self):
+        """Toggle between Pause and Resume for the Video Converter."""
+        if not self._conv_paused:
+            # ── Entering pause ─────────────────────────────────────────────
+            self._conv_paused = True
+            self._conv_pause_flag.set()
+            self._conv_pause_btn.configure(state="disabled")   # re-enabled in _conv_on_pause
+            # Terminate active ffmpeg procs; _process_one will reset them to Pending
+            with self._conv_procs_lock:
+                for proc in list(self._conv_current_procs):
+                    try:
+                        proc.terminate()
+                    except Exception:
+                        pass
+            self._conv_log(
+                "⏸  Pause requested — GPU will be released once active jobs wind down.")
+        else:
+            # ── Resuming ───────────────────────────────────────────────────
+            self._conv_paused = False
+            self._conv_pause_flag.clear()
+            self._conv_stop_flag.clear()
+            pending = [f for f in self._conv_files if f.status in ("Pending", "Error")]
+            if not pending:
+                self._conv_on_done()
+                return
+            self._conv_pause_btn.configure(text="⏸  Pause", state="normal")
+            self._conv_stop_btn.configure(state="normal")
+            n = len(pending)
+            self._conv_log(f"▶  Resuming — {n} file(s) remaining.")
+            threading.Thread(
+                target=self._conv_worker, args=(pending,), daemon=True).start()
+
+    def _conv_on_pause(self):
+        """Called from the worker thread (via after()) once all active jobs have wound down."""
+        self._conv_log("⏸  Paused — GPU released. Click Resume to continue.")
+        self._conv_pause_btn.configure(text="▶  Resume", state="normal")
+        self._conv_stop_btn.configure(state="disabled")
 
     def _conv_set_overall(self, done: int, total: int):
         self._conv_overall_bar["value"] = done / total * 100 if total else 0
@@ -2033,6 +2087,11 @@ class App(tk.Tk):
         def _process_one(info: FileInfo):
             if self._conv_stop_flag.is_set():
                 info.status = "Cancelled"
+                self.after(0, self._conv_refresh_row, info)
+                _inc_done()
+                return
+            if self._conv_pause_flag.is_set():
+                # Leave status as-is (Pending) so Resume picks it up
                 self.after(0, self._conv_refresh_row, info)
                 _inc_done()
                 return
@@ -2115,7 +2174,8 @@ class App(tk.Tk):
                     except ValueError:
                         pass
 
-                if ret == 0 and not self._conv_stop_flag.is_set():
+                if ret == 0 and not self._conv_stop_flag.is_set() \
+                        and not self._conv_pause_flag.is_set():
                     info.status = "Done"
                     out_mb = output.stat().st_size / 1_048_576 if output.exists() else 0
                     ratio  = out_mb / info.size_mb * 100 if info.size_mb else 0
@@ -2128,6 +2188,16 @@ class App(tk.Tk):
                     elif self._conv_del_orig_var.get() and output.exists():
                         info.path.unlink()
                         self._conv_log("  [del] original removed")
+                elif self._conv_pause_flag.is_set():
+                    # Reset so Resume re-processes this file from the start
+                    info.status = "Pending"
+                    info.progress = 0.0
+                    if output.exists():
+                        try:
+                            output.unlink()
+                        except OSError:
+                            pass
+                    self._conv_log(f"[paused] {info.path.name}  (will restart on Resume)")
                 else:
                     info.status = "Cancelled" if self._conv_stop_flag.is_set() else "Error"
                     self._conv_log(f"[fail] {info.path.name}  exit={ret}")
@@ -2150,6 +2220,11 @@ class App(tk.Tk):
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=n_parallel) as pool:
             list(pool.map(_process_one, files))
+
+        if self._conv_pause_flag.is_set():
+            # Worker wound down due to Pause — notify main thread
+            self.after(0, self._conv_on_pause)
+            return
 
         counts = {s: sum(1 for f in files if f.status == s)
                   for s in ("Done", "Skipped", "Error", "Cancelled")}
@@ -2311,6 +2386,7 @@ class App(tk.Tk):
         self._combined_btn.configure(state="disabled")
         self._conv_combined_btn.configure(state="disabled")
         self._conv_start_btn.configure(state="disabled")
+        self._conv_pause_btn.configure(state="disabled")
         self._conv_stop_btn.configure(state="disabled")
 
         self._worker = threading.Thread(
@@ -2329,6 +2405,7 @@ class App(tk.Tk):
         self._combined_btn.configure(state="normal")
         self._conv_combined_btn.configure(state="normal")
         self._conv_start_btn.configure(state="normal")
+        self._conv_pause_btn.configure(text="⏸  Pause", state="disabled")
         self._conv_stop_btn.configure(state="disabled")
         self._progress["value"] = 100
         self._pct_lbl.configure(text="100%")
@@ -2563,6 +2640,7 @@ class App(tk.Tk):
         self._stop_btn.configure(state="disabled")        # no TM stop for this mode
         self._combined_btn.configure(state="disabled")
         self._conv_start_btn.configure(state="disabled")
+        self._conv_pause_btn.configure(state="disabled")
         self._conv_stop_btn.configure(state="normal")     # conv Stop halts ffmpeg
         self._conv_combined_btn.configure(state="disabled")
 
@@ -2580,6 +2658,7 @@ class App(tk.Tk):
         self._stop_btn.configure(state="disabled")
         self._combined_btn.configure(state="normal")
         self._conv_start_btn.configure(state="normal")
+        self._conv_pause_btn.configure(text="⏸  Pause", state="disabled")
         self._conv_stop_btn.configure(state="disabled")
         self._conv_combined_btn.configure(state="normal")
         self._conv_converting = False
