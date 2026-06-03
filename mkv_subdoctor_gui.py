@@ -2670,124 +2670,143 @@ class App(tk.Tk):
                                keep_langs, remaps, dry_run, no_log,
                                spell_check, manage_audio, audio_langs, log_dir,
                                preferred_sub_lang=None, preferred_audio_lang=None):
-        """Combined pipeline from the Converter tab: TM (MKV only) → ffmpeg.
-        Updates the Converter treeview rows throughout."""
+        """Combined pipeline from the Converter tab: TM (sequential) → ffmpeg (parallel).
+        TM must stay sequential because contextlib.redirect_stdout is not thread-safe.
+        """
         if no_log:
             core._LOG_DIR = None
         else:
             core._LOG_DIR = Path(log_dir)
 
         total          = len(files)
-        done           = 0
         tm_changed     = 0
-        converted      = 0
-        errors         = 0
-        time_re        = re.compile(r"time=(\d+):(\d+):(\d+)\.(\d+)")
         stream         = _QueueStream(self._output_q)
         skip_processed = self._tm_skip_processed_var.get()
         tm_hash        = self._compute_tm_hash(keep_langs, remaps, manage_audio,
                                                audio_langs, preferred_sub_lang,
                                                preferred_audio_lang, spell_check)
         conv_hash      = self._compute_conv_hash()
+        n_parallel     = max(1, self._conv_parallel_var.get())
 
         self._conv_log(
             f"[Combined Mode — Converter] {total} file(s)  "
-            f"—  Track Manager (MKV only)  →  Video Converter")
+            f"—  Track Manager  →  Video Encoder  ({n_parallel} parallel job(s))")
         if dry_run:
             self._conv_log(
                 "[DRY RUN — TM will not modify files; conversion will still run]")
 
-        for idx, info in enumerate(files):
+        # ── Phase 1: Track Manager (sequential — redirect_stdout not thread-safe) ──
+        self._conv_log("\n─── Phase 1 / Track Manager ─────────────────────────────")
+        tm_total = sum(1 for f in files if f.path.suffix.lower() == ".mkv")
+        tm_done  = 0
+        for info in files:
             if self._conv_stop_flag.is_set():
-                info.status = "Cancelled"
-                self.after(0, self._conv_refresh_row, info)
+                break
+
+            if info.path.suffix.lower() != ".mkv":
+                continue   # non-MKV: no TM step, encode in Phase 2
+
+            if skip_processed and not dry_run and self._history_check(info.path, tm_hash):
+                self._output_q.put(
+                    f"[TM skip] {info.path.name}  (already processed)\n")
+                tm_done += 1
                 continue
 
-            file_num = f"{idx + 1}/{total}"
+            tm_done += 1
+            info.status = "TM Clean…"
+            self.after(0, self._conv_refresh_row, info)
+            self._output_q.put(f"[TM {tm_done}/{tm_total}] {info.path.name}\n")
+            try:
+                with contextlib.redirect_stdout(stream):
+                    changed = core.process_mkv(
+                        str(info.path), dry_run=dry_run, remap_langs=remaps,
+                        keep_langs=keep_langs, spell_check=spell_check,
+                        manage_audio=manage_audio, audio_langs=audio_langs,
+                        preferred_sub_lang=preferred_sub_lang,
+                        preferred_audio_lang=preferred_audio_lang,
+                    )
+                if changed:
+                    tm_changed += 1
+                if not dry_run:
+                    self._history_record(info.path, tm_hash)
+                # Reset to Pending so Phase 2 picks it up
+                info.status = "Pending"
+                self.after(0, self._conv_refresh_row, info)
+            except Exception as exc:
+                self._output_q.put(f"  TM ERROR: {exc}\n")
+                info.status = "Error"   # will be skipped in Phase 2
+                self.after(0, self._conv_refresh_row, info)
 
-            # ── Step 1: Track Manager (MKV files only) ────────────────────
-            if info.path.suffix.lower() == ".mkv":
-                # Skip TM if already processed with current settings
-                if skip_processed and not dry_run and self._history_check(info.path, tm_hash):
-                    self._output_q.put(
-                        f"── [{file_num}] TM skipped (already processed): {info.path.name}\n")
-                else:
-                    info.status = "TM Clean…"
+        self._conv_log(
+            f"   Track Manager complete — {tm_changed} file(s) modified, "
+            f"{tm_done} processed.")
+
+        if self._conv_stop_flag.is_set():
+            for info in files:
+                if info.status not in ("Done", "Error"):
+                    info.status = "Cancelled"
                     self.after(0, self._conv_refresh_row, info)
-                    self._output_q.put(
-                        f"── [{file_num}] Track Manager: {info.path.name}\n")
-                    try:
-                        with contextlib.redirect_stdout(stream):
-                            changed = core.process_mkv(
-                                str(info.path), dry_run=dry_run, remap_langs=remaps,
-                                keep_langs=keep_langs, spell_check=spell_check,
-                                manage_audio=manage_audio, audio_langs=audio_langs,
-                                preferred_sub_lang=preferred_sub_lang,
-                                preferred_audio_lang=preferred_audio_lang,
-                            )
-                        if changed:
-                            tm_changed += 1
-                        if not dry_run:
-                            self._history_record(info.path, tm_hash)
-                    except Exception as exc:
-                        self._output_q.put(f"  TM ERROR: {exc}\n")
-                        info.status = "Error"
-                        self.after(0, self._conv_refresh_row, info)
-                        errors += 1
-                        done += 1
-                        self.after(0, self._conv_set_overall, done, total)
-                        continue
-            else:
-                self._conv_log(
-                    f"[{file_num}] Skipping Track Manager (not MKV): {info.path.name}")
+            self.after(0, self._combined_on_done_conv)
+            return
 
+        # ── Phase 2: Video Encoder (parallel) ─────────────────────────────────
+        self._conv_log(f"\n─── Phase 2 / Encoder  ({n_parallel} parallel) ──────────────────")
+
+        encode_files = [f for f in files if f.status != "Error"]
+        enc_total    = len(encode_files)
+        done_count   = [0]
+        done_lock    = threading.Lock()
+        time_re      = re.compile(r"time=(\d+):(\d+):(\d+)\.(\d+)")
+        no_change    = (self._conv_preset_var.get() == "No Change")
+
+        def _enc_done():
+            with done_lock:
+                done_count[0] += 1
+                d = done_count[0]
+            self.after(0, self._conv_set_overall, d, enc_total)
+
+        def _encode_one(info: FileInfo):
             if self._conv_stop_flag.is_set():
                 info.status = "Cancelled"
                 self.after(0, self._conv_refresh_row, info)
-                continue
+                _enc_done()
+                return
 
-            # ── Step 2: Video Converter ───────────────────────────────────
-            if self._conv_preset_var.get() == "No Change":
-                info.status = "Skipped"
-                self._conv_log(f"[no-change] {info.path.name}  (conversion skipped by preset)")
-                self.after(0, self._conv_refresh_row, info)
-                done += 1
-                self.after(0, self._conv_set_overall, done, total)
-                continue
-
-            # Skip conv step if already processed with current conv settings
-            if self._conv_skip_processed_var.get() and self._history_check(info.path, conv_hash):
+            if no_change:
                 info.status = "Skipped"
                 self._conv_log(
-                    f"[skip] {info.path.name}  (already processed with current conv settings)")
+                    f"[no-change] {info.path.name}  (conversion skipped by preset)")
                 self.after(0, self._conv_refresh_row, info)
-                done += 1
-                self.after(0, self._conv_set_overall, done, total)
-                continue
+                _enc_done()
+                return
 
-            # Refresh probe data if not yet populated
+            if self._conv_skip_processed_var.get() \
+                    and self._history_check(info.path, conv_hash):
+                info.status = "Skipped"
+                self._conv_log(
+                    f"[skip] {info.path.name}  (already processed with current settings)")
+                self.after(0, self._conv_refresh_row, info)
+                _enc_done()
+                return
+
             if info.duration == 0:
                 self._conv_probe_sync(info)
 
-            # Skip if already compatible (respects the checkbox)
             if self._conv_skip_compat_var.get() and info.is_plex_compatible:
                 info.status = "Skipped"
                 self._conv_log(f"[skip] {info.path.name}  (already compatible)")
                 self.after(0, self._conv_refresh_row, info)
-                done += 1
-                self.after(0, self._conv_set_overall, done, total)
-                continue
+                _enc_done()
+                return
 
             output = self._conv_output_path(info)
             if output.exists() and not self._conv_overwrite_var.get():
                 info.status = "Skipped"
                 self._conv_log(f"[skip] {info.path.name}  (output exists)")
                 self.after(0, self._conv_refresh_row, info)
-                done += 1
-                self.after(0, self._conv_set_overall, done, total)
-                continue
+                _enc_done()
+                return
 
-            # Capture pre-conversion stats for history
             pre_size, pre_mtime = 0, 0.0
             try:
                 _st = info.path.stat()
@@ -2796,18 +2815,19 @@ class App(tk.Tk):
                 pass
 
             cmd = self._conv_build_cmd(info, output)
-            self._conv_log(f"\n[Combined {file_num}] {info.path.name}")
+            self._conv_log(f"\n[start] {info.path.name}")
             self._conv_log(f"    →  {output}")
-
             info.status = "Converting"
             self.after(0, self._conv_refresh_row, info)
 
+            proc = None
             try:
                 proc = subprocess.Popen(
                     cmd, stderr=subprocess.PIPE,
                     universal_newlines=True, encoding="utf-8", errors="replace",
                 )
-                self._conv_current_proc = proc
+                with self._conv_procs_lock:
+                    self._conv_current_procs.append(proc)
 
                 for line in proc.stderr:
                     if self._conv_stop_flag.is_set():
@@ -2824,7 +2844,11 @@ class App(tk.Tk):
                         self._conv_log(f"    ! {line.rstrip()}")
 
                 ret = proc.wait()
-                self._conv_current_proc = None
+                with self._conv_procs_lock:
+                    try:
+                        self._conv_current_procs.remove(proc)
+                    except ValueError:
+                        pass
 
                 if ret == 0 and not self._conv_stop_flag.is_set():
                     info.status = "Done"
@@ -2833,7 +2857,6 @@ class App(tk.Tk):
                     self._conv_log(
                         f"[done] {info.path.name}  "
                         f"{info.size_mb:.0f} MB → {out_mb:.0f} MB  ({ratio:.0f}%)")
-                    converted += 1
                     self._history_record_at(info.path, pre_size, pre_mtime, conv_hash)
                     if self._conv_replace_orig_var.get() and output.exists():
                         self._conv_do_replace_original(info, output)
@@ -2845,19 +2868,23 @@ class App(tk.Tk):
                     self._conv_log(f"[fail] {info.path.name}  exit={ret}")
                     if output.exists():
                         output.unlink()
-                    if info.status == "Error":
-                        errors += 1
 
             except Exception as exc:
                 info.status = "Error"
                 self._conv_log(f"[err]  {info.path.name}: {exc}")
-                self._conv_current_proc = None
-                errors += 1
+                if proc is not None:
+                    with self._conv_procs_lock:
+                        try:
+                            self._conv_current_procs.remove(proc)
+                        except ValueError:
+                            pass
 
             self.after(0, self._conv_refresh_row, info,
                        "100%" if info.status == "Done" else "")
-            done += 1
-            self.after(0, self._conv_set_overall, done, total)
+            _enc_done()
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=n_parallel) as pool:
+            list(pool.map(_encode_one, encode_files))
 
         counts = {s: sum(1 for f in files if f.status == s)
                   for s in ("Done", "Skipped", "Error", "Cancelled")}
