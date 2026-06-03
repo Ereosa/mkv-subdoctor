@@ -2240,8 +2240,20 @@ class App(tk.Tk):
                        "100%" if info.status == "Done" else "")
             _inc_done()
 
+        def _safe_process_one(info: FileInfo):
+            try:
+                _process_one(info)
+            except Exception as exc:
+                self._conv_log(f"[err] {info.path.name}: unhandled exception — {exc}")
+                info.status = "Error"
+                self.after(0, self._conv_refresh_row, info)
+                with done_lock:
+                    done_count[0] += 1
+                    d = done_count[0]
+                self.after(0, self._conv_set_overall, d, total)
+
         with concurrent.futures.ThreadPoolExecutor(max_workers=n_parallel) as pool:
-            list(pool.map(_process_one, files))
+            list(pool.map(_safe_process_one, files))
 
         if self._conv_pause_flag.is_set():
             # Worker wound down due to Pause — notify main thread
@@ -2946,11 +2958,22 @@ class App(tk.Tk):
                 info = enc_q.get()
                 if info is None:
                     break
-                _encode_one(info)
+                try:
+                    _encode_one(info)
+                except Exception as exc:
+                    # Catch-all so a single bad file never kills the encoder thread
+                    self._conv_log(
+                        f"[err] {info.path.name}: unhandled exception — {exc}")
+                    info.status = "Error"
+                    self.after(0, self._conv_refresh_row, info)
+                    _inc_done()
 
         # ── Launch pipeline ───────────────────────────────────────────────────
         self._conv_log(
-            f"[pipeline] Starting TM thread + {n_parallel} encoder thread(s).")
+            f"[pipeline] {n_parallel} encoder thread(s)  |  "
+            f"skip_compat={s.get('skip_compat')}  "
+            f"no_change={s.get('no_change')}  "
+            f"preset={s.get('preset')}")
         tm_thread = threading.Thread(target=_tm_producer, daemon=True)
         enc_threads = [
             threading.Thread(target=_encoder_consumer, daemon=True)
