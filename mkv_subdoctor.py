@@ -34,6 +34,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
+# Suppress console windows that subprocess spawns on Windows for each
+# mkvmerge / mkvextract / ffmpeg call.  CREATE_NO_WINDOW exists only on Windows.
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
 # ── Tool discovery ─────────────────────────────────────────────────────────────
 
 def find_tool(name: str) -> str:
@@ -176,6 +180,7 @@ def mkv_json(path: str) -> dict:
     r = subprocess.run(
         [MKVMERGE, "-J", path],
         capture_output=True, text=True, encoding="utf-8",
+        creationflags=_NO_WINDOW,
     )
     if r.returncode != 0:
         raise RuntimeError(r.stderr.strip())
@@ -209,6 +214,7 @@ def extract_all_tracks(mkv: str, sub_tracks: list[dict], outdir: str) -> dict[in
     r = subprocess.run(
         [MKVEXTRACT, mkv, "tracks"] + specs,
         capture_output=True, text=True, encoding="utf-8",
+        creationflags=_NO_WINDOW,
     )
     # mkvextract returns 0 (ok) or 1 (warnings) — both are usable
     if r.returncode > 1:
@@ -409,7 +415,7 @@ def ocr_vobsub(sub_path: str, max_samples: int = OCR_SAMPLE_COUNT) -> Optional[s
             "-vframes", str(max_samples * 4),  # grab extra frames (many may be blank)
             png_pattern,
         ]
-        subprocess.run(cmd, capture_output=True)
+        subprocess.run(cmd, capture_output=True, creationflags=_NO_WINDOW)
 
         for png in sorted(Path(td).glob("frame*.png"))[:max_samples * 2]:
             try:
@@ -1161,7 +1167,8 @@ def process_mkv(mkv_path: str, dry_run: bool = False,
                                  kept_audio=kept_audio)
 
         print("  Remuxing …")
-        r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8")
+        r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8",
+                           creationflags=_NO_WINDOW)
 
         # mkvmerge exit: 0 = ok, 1 = warnings, 2 = error
         if r.returncode >= 2:

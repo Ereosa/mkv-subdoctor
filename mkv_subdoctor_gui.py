@@ -56,6 +56,10 @@ try:
 except ImportError:
     _PIL_OK = False
 
+# Suppress the console windows that subprocess spawns on Windows for each
+# ffmpeg/ffprobe call.  CREATE_NO_WINDOW exists only on Windows.
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
 _BMC_URL = "https://buymeacoffee.com/mkvsubdoctor"
 
 # ── Load the core module ──────────────────────────────────────────────────────
@@ -1878,6 +1882,7 @@ class App(tk.Tk):
                 [self._ffprobe, "-v", "quiet", "-print_format", "json",
                  "-show_streams", "-show_format", str(info.path)],
                 capture_output=True, text=True, timeout=30,
+                creationflags=_NO_WINDOW,
             )
             if not result.stdout:
                 self._conv_log(f"Probe warning — no output for: {info.path.name}")
@@ -1914,6 +1919,7 @@ class App(tk.Tk):
                 [self._ffprobe, "-v", "quiet", "-print_format", "json",
                  "-show_streams", "-show_format", str(info.path)],
                 capture_output=True, text=True, timeout=30,
+                creationflags=_NO_WINDOW,
             )
             if not result.stdout:
                 return
@@ -2190,6 +2196,7 @@ class App(tk.Tk):
                 proc = subprocess.Popen(
                     cmd, stderr=subprocess.PIPE,
                     universal_newlines=True, encoding="utf-8", errors="replace",
+                    creationflags=_NO_WINDOW,
                 )
                 with self._conv_procs_lock:
                     self._conv_current_procs.append(proc)
@@ -2669,6 +2676,7 @@ class App(tk.Tk):
                     proc = subprocess.Popen(
                         cmd, stderr=subprocess.PIPE,
                         universal_newlines=True, encoding="utf-8", errors="replace",
+                        creationflags=_NO_WINDOW,
                     )
                     with self._conv_procs_lock:
                         self._conv_current_procs.append(proc)
@@ -2975,6 +2983,7 @@ class App(tk.Tk):
                     proc = subprocess.Popen(
                         cmd, stderr=subprocess.PIPE,
                         universal_newlines=True, encoding="utf-8", errors="replace",
+                        creationflags=_NO_WINDOW,
                     )
                     with self._conv_procs_lock:
                         self._conv_current_procs.append(proc)
