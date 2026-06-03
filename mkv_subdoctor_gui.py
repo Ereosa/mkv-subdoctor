@@ -1645,11 +1645,12 @@ class App(tk.Tk):
         self._conv_start_btn.configure(state="disabled")
         self._conv_combined_btn.configure(state="disabled")
 
+        tm_skip_processed = self._tm_skip_processed_var.get()   # main thread
         self._worker = threading.Thread(
             target=self._worker_func,
             args=(paths, keep_langs, remaps, dry_run, recursive, no_log,
                   spell_check, manage_audio, audio_langs, log_dir,
-                  preferred_sub_lang, preferred_audio_lang),
+                  preferred_sub_lang, preferred_audio_lang, tm_skip_processed),
             daemon=True,
         )
         self._worker.start()
@@ -1689,7 +1690,8 @@ class App(tk.Tk):
 
     def _worker_func(self, paths, keep_langs, remaps, dry_run, recursive, no_log,
                      spell_check, manage_audio, audio_langs, log_dir,
-                     preferred_sub_lang=None, preferred_audio_lang=None):
+                     preferred_sub_lang=None, preferred_audio_lang=None,
+                     tm_skip_processed=False):
         if no_log:
             core._LOG_DIR = None
         else:
@@ -1720,7 +1722,7 @@ class App(tk.Tk):
 
         modified       = 0
         errors         = 0
-        skip_processed = self._tm_skip_processed_var.get()
+        skip_processed = tm_skip_processed
         tm_hash        = self._compute_tm_hash(keep_langs, remaps, manage_audio,
                                                audio_langs, preferred_sub_lang,
                                                preferred_audio_lang, spell_check)
@@ -2472,12 +2474,13 @@ class App(tk.Tk):
         self._conv_pause_btn.configure(state="disabled")
         self._conv_stop_btn.configure(state="disabled")
 
-        _s = self._conv_read_settings()   # snapshot on main thread
+        _s = self._conv_read_settings()              # snapshot on main thread
+        n_parallel = max(1, self._conv_parallel_var.get())   # main thread
         self._worker = threading.Thread(
             target=self._combined_worker,
             args=(paths, keep_langs, remaps, dry_run, recursive, no_log,
                   spell_check, manage_audio, audio_langs, log_dir,
-                  preferred_sub_lang, preferred_audio_lang, _s),
+                  preferred_sub_lang, preferred_audio_lang, _s, n_parallel),
             daemon=True,
         )
         self._worker.start()
@@ -2500,13 +2503,19 @@ class App(tk.Tk):
 
     def _combined_worker(self, paths, keep_langs, remaps, dry_run, recursive, no_log,
                          spell_check, manage_audio, audio_langs, log_dir,
-                         preferred_sub_lang=None, preferred_audio_lang=None, s=None):
+                         preferred_sub_lang=None, preferred_audio_lang=None,
+                         s=None, n_parallel: int = 1):
+        """TM-tab Combined Run.  Two-phase: TM sequential → encode in parallel.
+        Mirrors _combined_worker_conv but sources files by globbing `paths`."""
         if no_log:
             core._LOG_DIR = None
         else:
             core._LOG_DIR = Path(log_dir)
 
-        # Collect MKV files (same logic as _worker_func)
+        if s is None:
+            s = {}
+
+        # Collect MKV files
         mkv_files: list[Path] = []
         for raw in paths:
             p = Path(raw)
@@ -2521,102 +2530,129 @@ class App(tk.Tk):
             self.after(0, self._combined_on_done)
             return
 
-        total = len(mkv_files)
-        self._total = total
+        total            = len(mkv_files)
+        self._total      = total
+        files            = [FileInfo(path=p, size_mb=p.stat().st_size / 1_048_576)
+                            for p in mkv_files]
+        stream           = _QueueStream(self._output_q)
+        tm_skip_proc     = s.get("tm_skip_processed", False)
+        conv_skip_proc   = s.get("skip_processed", False)
+        skip_compat      = s.get("skip_compat", True)
+        no_change        = s.get("no_change", False)
+        conv_hash        = s.get("conv_hash", "")
+        time_re          = re.compile(r"time=(\d+):(\d+):(\d+)\.(\d+)")
+        tm_hash          = self._compute_tm_hash(keep_langs, remaps, manage_audio,
+                                                  audio_langs, preferred_sub_lang,
+                                                  preferred_audio_lang, spell_check)
+        tm_changed       = [0]
+        done_count       = [0]
+        done_lock        = threading.Lock()
+
+        def _stopped():
+            return core._stop_event.is_set() or self._conv_stop_flag.is_set()
+
+        def _set_progress(d):
+            pct = int(100 * d / total) if total else 0
+            self._progress["value"] = pct
+            self._pct_lbl.configure(text=f"{pct}%")
+            self._status_lbl.configure(text=f"Encoding: {d}/{total}")
+
+        def _inc_done():
+            with done_lock:
+                done_count[0] += 1
+                d = done_count[0]
+            self.after(0, _set_progress, d)
+
         self._output_q.put(
-            f"[Combined Mode] {total} file(s)  "
-            f"—  Track Manager  →  Video Converter\n")
+            f"[Combined Mode] {total} file(s)  —  TM → Encoder × {n_parallel}\n"
+            f"  skip_compat={skip_compat}  skip_processed={conv_skip_proc}  "
+            f"no_change={no_change}  preset={s.get('preset')}\n")
         self._output_q.put(f"Keeping languages: {sorted(keep_langs)}\n")
-        if remaps:
-            self._output_q.put(f"Language remaps: {remaps}\n")
         if dry_run:
-            self._output_q.put(
-                "[DRY RUN — Track Manager will not modify files; "
-                "conversion step will still run]\n")
+            self._output_q.put("[DRY RUN — TM will not modify files]\n")
         self._output_q.put("\n")
 
-        if s is None:
-            s = {}
-        tm_changed     = 0
-        converted      = 0
-        errors         = 0
-        time_re        = re.compile(r"time=(\d+):(\d+):(\d+)\.(\d+)")
-        stream         = _QueueStream(self._output_q)
-        skip_processed = self._tm_skip_processed_var.get()
-        tm_hash        = self._compute_tm_hash(keep_langs, remaps, manage_audio,
-                                               audio_langs, preferred_sub_lang,
-                                               preferred_audio_lang, spell_check)
-        conv_hash      = s.get("conv_hash", "")
-
-        for idx, f in enumerate(mkv_files):
-            if core._stop_event.is_set():
-                self._output_q.put("\nCombined run stopped by user.\n")
+        # ── Phase 1: Track Manager (sequential) ──────────────────────────────
+        self._output_q.put("─── Phase 1 / Track Manager ─────────────────────────────\n")
+        for info in files:
+            if _stopped():
                 break
-
-            file_num = f"{idx + 1}/{total}"
-            self._done = idx + 1
-
-            def _upd_progress(pct, label, d=self._done, t=total):
-                self._progress["value"] = pct
-                self._pct_lbl.configure(text=f"{pct}%")
-                self._status_lbl.configure(text=f"{label}: {d}/{t}")
-
-            pct_step = int(100 * (idx + 1) / total)
-
-            # ── Step 1: Track Manager ─────────────────────────────────────
-            self.after(0, _upd_progress, pct_step, "TM")
-            self._output_q.put(f"── [{file_num}] Track Manager ──────────────────\n")
-            # Skip TM step if already processed with current settings
-            if skip_processed and not dry_run and self._history_check(f, tm_hash):
-                self._output_q.put(
-                    f"  Already processed with current TM settings — skipping TM.\n")
-                tm_skipped = True
-            else:
-                tm_skipped = False
-                try:
-                    with contextlib.redirect_stdout(stream):
-                        changed = core.process_mkv(
-                            str(f), dry_run=dry_run, remap_langs=remaps,
-                            keep_langs=keep_langs, spell_check=spell_check,
-                            manage_audio=manage_audio, audio_langs=audio_langs,
-                            preferred_sub_lang=preferred_sub_lang,
-                            preferred_audio_lang=preferred_audio_lang,
-                        )
-                    if changed:
-                        tm_changed += 1
-                    if not dry_run:
-                        self._history_record(f, tm_hash)
-                except Exception as exc:
-                    self._output_q.put(f"  TM ERROR: {exc}\n")
-                    errors += 1
-                    continue
-
-            if core._stop_event.is_set():
-                self._output_q.put("\nCombined run stopped by user.\n")
-                break
-
-            # ── Step 2: Video Converter ───────────────────────────────────
-            if s.get("no_change"):
-                self._conv_log(f"[no-change] {f.name}  (conversion skipped by preset)")
+            f = info.path
+            if tm_skip_proc and not dry_run and self._history_check(f, tm_hash):
+                self._output_q.put(f"[TM skip] {f.name}\n")
                 continue
+            self._output_q.put(f"[TM] {f.name}\n")
+            try:
+                with contextlib.redirect_stdout(stream):
+                    changed = core.process_mkv(
+                        str(f), dry_run=dry_run, remap_langs=remaps,
+                        keep_langs=keep_langs, spell_check=spell_check,
+                        manage_audio=manage_audio, audio_langs=audio_langs,
+                        preferred_sub_lang=preferred_sub_lang,
+                        preferred_audio_lang=preferred_audio_lang,
+                    )
+                if changed:
+                    tm_changed[0] += 1
+                if not dry_run:
+                    self._history_record(f, tm_hash)
+            except Exception as exc:
+                self._output_q.put(f"  TM ERROR {f.name}: {exc}\n")
+                info.status = "Error"
 
-            # Skip conv step if already processed with current conv settings
-            if s.get("skip_processed") and self._history_check(f, conv_hash):
+        self._output_q.put(f"   TM complete — {tm_changed[0]} file(s) modified.\n")
+
+        if _stopped():
+            self._output_q.put("\nCombined run stopped by user.\n")
+            self.after(0, self._combined_on_done)
+            return
+
+        if dry_run:
+            self._output_q.put("[dry run] Skipping conversion phase.\n")
+            self.after(0, self._combined_on_done)
+            return
+
+        # ── Phase 2: Parallel encoding ────────────────────────────────────────
+        encode_list = [f for f in files if f.status != "Error"]
+        self._output_q.put(
+            f"\n─── Phase 2 / Encoder × {n_parallel}  "
+            f"({len(encode_list)} files) ─────────────────\n")
+
+        def _encode_file(info: FileInfo):
+            try:
+                f = info.path
+                if _stopped():
+                    return
+
+                if no_change:
+                    self._conv_log(f"[no-change] {f.name}")
+                    _inc_done()
+                    return
+
+                if conv_skip_proc and self._history_check(f, conv_hash):
+                    self._conv_log(f"[skip] {f.name}  (already processed)")
+                    _inc_done()
+                    return
+
+                if info.video_codec == "—" or info.duration == 0:
+                    self._conv_probe_sync(info)
+
+                if skip_compat and info.is_plex_compatible:
+                    self._conv_log(
+                        f"[skip] {f.name}  "
+                        f"(compatible: {info.video_codec}/{info.audio_codec})")
+                    _inc_done()
+                    return
+
                 self._conv_log(
-                    f"[skip] {f.name}  (already processed with current conv settings)")
-                continue
+                    f"[encode] {f.name}  {info.video_codec}/{info.audio_codec}  "
+                    f"compatible={info.is_plex_compatible}")
 
-            self.after(0, _upd_progress, pct_step, "Converting")
-            info = FileInfo(path=f, size_mb=f.stat().st_size / 1_048_576)
-            self._conv_probe_sync(info)   # fills duration for progress %
-
-            if not dry_run:
                 output = self._conv_output_path(info, s)
-                cmd    = self._conv_build_cmd(info, output, s)
-                self._conv_log(f"\n[Combined {file_num}] {f.name}")
-                self._conv_log(f"    →  {output}")
+                if output.exists() and not s.get("overwrite"):
+                    self._conv_log(f"[skip] {f.name}  (output exists)")
+                    _inc_done()
+                    return
 
-                # Capture pre-conversion stats for history
                 pre_size, pre_mtime = 0, 0.0
                 try:
                     _st = f.stat()
@@ -2624,15 +2660,21 @@ class App(tk.Tk):
                 except OSError:
                     pass
 
+                cmd = self._conv_build_cmd(info, output, s)
+                self._conv_log(f"\n[start] {f.name}")
+                self._conv_log(f"    →  {output}")
+
+                proc = None
                 try:
                     proc = subprocess.Popen(
                         cmd, stderr=subprocess.PIPE,
                         universal_newlines=True, encoding="utf-8", errors="replace",
                     )
-                    self._conv_current_proc = proc
+                    with self._conv_procs_lock:
+                        self._conv_current_procs.append(proc)
 
                     for line in proc.stderr:
-                        if core._stop_event.is_set():
+                        if _stopped():
                             proc.terminate()
                             break
                         m = time_re.search(line)
@@ -2645,15 +2687,18 @@ class App(tk.Tk):
                             self._conv_log(f"    ! {line.rstrip()}")
 
                     ret = proc.wait()
-                    self._conv_current_proc = None
+                    with self._conv_procs_lock:
+                        try:
+                            self._conv_current_procs.remove(proc)
+                        except ValueError:
+                            pass
 
-                    if ret == 0 and not core._stop_event.is_set():
+                    if ret == 0 and not _stopped():
                         out_mb = output.stat().st_size / 1_048_576 if output.exists() else 0
                         ratio  = out_mb / info.size_mb * 100 if info.size_mb else 0
                         self._conv_log(
                             f"[done] {f.name}  "
                             f"{info.size_mb:.0f} MB → {out_mb:.0f} MB  ({ratio:.0f}%)")
-                        converted += 1
                         self._history_record_at(f, pre_size, pre_mtime, conv_hash)
                         if s.get("replace_orig") and output.exists():
                             self._conv_do_replace_original(info, output)
@@ -2664,22 +2709,31 @@ class App(tk.Tk):
                         self._conv_log(f"[fail] {f.name}  exit={ret}")
                         if output.exists():
                             output.unlink()
-                        errors += 1
 
                 except Exception as exc:
-                    self._conv_log(f"[err]  {f.name}: {exc}")
-                    self._conv_current_proc = None
-                    errors += 1
-            else:
-                self._conv_log(f"[dry run] Would convert: {f.name}")
+                    self._conv_log(f"[err] {f.name}: {exc}")
+                    if proc is not None:
+                        with self._conv_procs_lock:
+                            try:
+                                self._conv_current_procs.remove(proc)
+                            except ValueError:
+                                pass
+
+                _inc_done()
+
+            except Exception as exc:
+                self._conv_log(f"[err] {info.path.name}: unexpected — {exc}")
+                _inc_done()
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=n_parallel) as pool:
+            futures = [pool.submit(_encode_file, info) for info in encode_list]
+            concurrent.futures.wait(futures)
 
         sep = "=" * 60
         self._output_q.put(f"\n{sep}\n")
         self._output_q.put(
             f"Combined complete: {total} file(s)\n"
-            f"  Track Manager changes : {tm_changed}\n"
-            f"  Converted             : {converted}\n"
-            f"  Errors                : {errors}\n"
+            f"  Track Manager changes : {tm_changed[0]}\n"
         )
         self.after(0, self._combined_on_done)
 
