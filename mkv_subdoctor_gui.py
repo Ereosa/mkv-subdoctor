@@ -226,6 +226,36 @@ PRESETS = {
     },
 }
 
+# ── Codec efficiency ranking ──────────────────────────────────────────────────
+# Higher rank = newer / more space-efficient codec.  Used to decide whether a
+# file is "already good enough" relative to the chosen target codec.
+_PLEX_AUDIO = {"aac", "mp3", "ac3", "eac3", "dts", "opus", "flac", "truehd"}
+_PLEX_CONTAINERS = {".mp4", ".mkv", ".mov"}
+
+
+def _codec_rank(codec: str) -> int:
+    c = (codec or "").lower()
+    if "av1" in c:
+        return 3
+    if c in ("hevc", "h265") or "265" in c or c == "vp9":
+        return 2
+    if c in ("h264", "avc") or "264" in c:
+        return 1
+    return 0   # unknown / older (mpeg2, xvid, vc1, …) → always worth converting
+
+
+def _target_vrank(vcodec: str) -> int:
+    """Rank of the selected output video codec (from the GUI's vcodec value)."""
+    v = (vcodec or "").lower()
+    if "av1" in v:            # libsvtav1 / av1_nvenc / …
+        return 3
+    if "265" in v or "hevc" in v:
+        return 2
+    if "264" in v:
+        return 1
+    return 0                 # "copy" or unknown → nothing to gain by re-encoding
+
+
 # ── FileInfo dataclass ────────────────────────────────────────────────────────
 
 @dataclass
@@ -246,10 +276,23 @@ class FileInfo:
         vc = self.video_codec.lower()
         ac = self.audio_codec.lower()
         return (
-            container in {".mp4", ".mkv", ".mov"}
+            container in _PLEX_CONTAINERS
             and vc in {"h264", "hevc", "h265", "av1"}
-            and ac in {"aac", "mp3", "ac3", "eac3", "dts", "opus", "flac", "truehd"}
+            and ac in _PLEX_AUDIO
         )
+
+    def is_at_or_above_target(self, target_vrank: int) -> bool:
+        """True if this file's video codec is already at least as efficient as the
+        chosen target (so re-encoding it would waste effort / add no space saving).
+        Used by 'Skip already compatible files' in target-aware mode.
+
+        e.g. target = HEVC (rank 2):  hevc/av1 → True (skip), h264 → False (convert)."""
+        if self.path.suffix.lower() not in _PLEX_CONTAINERS:
+            return False
+        if self.audio_codec.lower() not in _PLEX_AUDIO:
+            return False
+        src = _codec_rank(self.video_codec)
+        return src > 0 and src >= target_vrank
 
 # ── Stdout redirector ─────────────────────────────────────────────────────────
 
@@ -2316,11 +2359,11 @@ class App(tk.Tk):
                 _inc_done()
                 return
 
-            # Skip already-compatible files
-            if s.get("skip_compat") and info.is_plex_compatible:
+            # Skip files already at or above the target codec (target-aware)
+            if s.get("skip_compat") and info.is_at_or_above_target(s.get("target_vrank", 0)):
                 info.status = "Skipped"
                 self._conv_log(
-                    f"[skip] {info.path.name}  (already compatible:"
+                    f"[skip] {info.path.name}  (already ≥ target codec:"
                     f" {info.video_codec}/{info.audio_codec})")
                 self.after(0, self._conv_refresh_row, info)
                 _inc_done()
@@ -2482,6 +2525,8 @@ class App(tk.Tk):
             "skip_logged":       self._conv_skip_logged_var.get(),
             "log_completed":     set(self._log_completed),               # frozen copy
         }
+        # Target-aware skip: rank of the chosen output video codec
+        s["target_vrank"] = _target_vrank(s["vcodec"])
         # Pre-compute hash from encode-relevant keys
         hash_keys = ("preset", "container", "vcodec", "crf", "enc_preset",
                      "resolution", "hwaccel", "acodec", "abitrate", "subtitle")
@@ -2706,6 +2751,7 @@ class App(tk.Tk):
         tm_skip_proc     = s.get("tm_skip_processed", False)
         conv_skip_proc   = s.get("skip_processed", False)
         skip_compat      = s.get("skip_compat", True)
+        target_vrank     = s.get("target_vrank", 0)
         no_change        = s.get("no_change", False)
         conv_hash        = s.get("conv_hash", "")
         skip_logged      = s.get("skip_logged", False)
@@ -2811,16 +2857,16 @@ class App(tk.Tk):
                 if info.video_codec == "—" or info.duration == 0:
                     self._conv_probe_sync(info)
 
-                if skip_compat and info.is_plex_compatible:
+                if skip_compat and info.is_at_or_above_target(target_vrank):
                     self._conv_log(
                         f"[skip] {f.name}  "
-                        f"(compatible: {info.video_codec}/{info.audio_codec})")
+                        f"(already ≥ target codec: {info.video_codec}/{info.audio_codec})")
                     _inc_done()
                     return
 
                 self._conv_log(
                     f"[encode] {f.name}  {info.video_codec}/{info.audio_codec}  "
-                    f"compatible={info.is_plex_compatible}")
+                    f"→ rank {_codec_rank(info.video_codec)} < target {target_vrank}")
 
                 output = self._conv_output_path(info, s)
                 if output.exists() and not s.get("overwrite"):
@@ -3005,6 +3051,7 @@ class App(tk.Tk):
         tm_skip_proc     = s.get("tm_skip_processed", False)
         conv_skip_proc   = s.get("skip_processed", False)
         skip_compat      = s.get("skip_compat", True)
+        target_vrank     = s.get("target_vrank", 0)
         no_change        = s.get("no_change", False)
         conv_hash        = s.get("conv_hash", "")
         skip_logged      = s.get("skip_logged", False)
@@ -3117,11 +3164,11 @@ class App(tk.Tk):
                 if info.video_codec == "—" or info.duration == 0:
                     self._conv_probe_sync(info)
 
-                if skip_compat and info.is_plex_compatible:
+                if skip_compat and info.is_at_or_above_target(target_vrank):
                     info.status = "Skipped"
                     self._conv_log(
                         f"[skip] {info.path.name}  "
-                        f"(compatible: {info.video_codec}/{info.audio_codec})")
+                        f"(already ≥ target codec: {info.video_codec}/{info.audio_codec})")
                     self.after(0, self._conv_refresh_row, info)
                     _inc_done()
                     return
@@ -3131,7 +3178,7 @@ class App(tk.Tk):
                     f"[encode] {info.path.name}  "
                     f"{info.video_codec}/{info.audio_codec}  "
                     f"skip_compat={skip_compat}  "
-                    f"compatible={info.is_plex_compatible}")
+                    f"src_rank={_codec_rank(info.video_codec)} < target={target_vrank}")
 
                 output = self._conv_output_path(info, s)
                 if output.exists() and not s.get("overwrite"):
