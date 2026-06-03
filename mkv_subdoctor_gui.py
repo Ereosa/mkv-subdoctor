@@ -2100,12 +2100,20 @@ class App(tk.Tk):
     # ── Video Converter: replace-original helper ──────────────────────────────
 
     def _conv_do_replace_original(self, info: FileInfo, output: Path) -> Path:
-        """Delete the original file and rename the output to the original stem
-        (keeping the new extension).  Returns the final path.
+        """Delete the original file and move the encoded output into the original's
+        FOLDER under the original stem (keeping the new extension).  Returns the
+        final path.
 
-        e.g.  Movie.mkv  +  Movie_plex.mp4  →  Movie.mp4
+        Works whether output is alongside the source ("Same as source") or in a
+        separate staging directory — the finished file always lands back in the
+        source folder so Plex sees it in place.
+
+        e.g.  P:\\Subbed\\…\\Movie.mkv  +  P:\\Staging\\Movie_plex.mkv
+              →  P:\\Subbed\\…\\Movie.mkv
         """
-        final = output.parent / f"{info.path.stem}{output.suffix}"
+        # Land the finished file in the SOURCE folder, not the staging/output folder
+        final = info.path.parent / f"{info.path.stem}{output.suffix}"
+
         # Delete original
         try:
             info.path.unlink()
@@ -2113,19 +2121,21 @@ class App(tk.Tk):
         except Exception as e:
             self._conv_log(f"  [warn] could not delete original: {e}")
             return output
-        # Rename with retry (Plex may briefly hold the file)
+
+        # Move with retry (Plex may briefly hold the destination).
+        # shutil.move handles same-drive (atomic rename) and cross-drive (copy)
         for attempt in range(6):
             try:
-                output.rename(final)
-                self._conv_log(f"  [renamed] {output.name}  →  {final.name}")
+                shutil.move(str(output), str(final))
+                self._conv_log(f"  [moved]  {output.name}  →  {final}")
                 return final
             except OSError as e:
                 if attempt < 5:
                     self._conv_log(
-                        f"  [retry {attempt + 1}/5] rename locked — waiting 5 s…")
+                        f"  [retry {attempt + 1}/5] move locked — waiting 5 s…")
                     time.sleep(5)
                 else:
-                    self._conv_log(f"  [err] rename failed after retries: {e}")
+                    self._conv_log(f"  [err] move failed after retries: {e}")
         return output
 
     # ── Video Converter: log helper ───────────────────────────────────────────
