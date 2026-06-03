@@ -2254,7 +2254,10 @@ class App(tk.Tk):
         # Hardware-accelerated decode
         hw = self._conv_hwaccel_var.get()
         if "NVIDIA" in hw:
-            cmd += ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]
+            # -hwaccel cuda uses NVDEC for fast GPU decode.
+            # Omitting -hwaccel_output_format cuda so decoded frames land in
+            # CPU memory — required for scale/pad filters to work with hevc_nvenc.
+            cmd += ["-hwaccel", "cuda"]
         elif "Intel" in hw:
             cmd += ["-hwaccel", "qsv"]
         elif "AMD" in hw:
