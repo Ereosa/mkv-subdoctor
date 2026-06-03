@@ -73,6 +73,7 @@ _APP_DATA   = Path(os.environ.get("APPDATA", Path.home())) / "MKVSubDoctor"
 _APP_DATA.mkdir(parents=True, exist_ok=True)
 _CONFIG     = _APP_DATA / "config.json"
 _HISTORY    = _APP_DATA / "history.json"
+_DONE_LOG   = _APP_DATA / "completed_from_logs.json"   # filenames marked done in logs
 
 # One-time migration: pull config from script dir if the shared one is absent
 for _old in (_SCRIPT_DIR / "mkv_subdoctor_config.json",
@@ -310,6 +311,7 @@ class App(tk.Tk):
         self._ffprobe = self._find_exe("ffprobe")
         self._conv_probe_sem = threading.Semaphore(4)
         self._history_lock   = threading.Lock()
+        self._log_completed: set[str] = self._load_completed_log()   # filenames done in logs
 
         # Load saved preferences
         prefs = self._load_prefs()
@@ -318,6 +320,7 @@ class App(tk.Tk):
         self._prefs_ready = False    # blocks auto-save during startup
         self._build_ui()
         self._restore_prefs(prefs)   # re-apply saved widget states
+        self._update_log_count_label()
         self._prefs_ready = True     # allow auto-save from here on
         self._apply_theme()
         self._poll_output()
@@ -374,6 +377,7 @@ class App(tk.Tk):
                     "conv_del_orig":        self._conv_del_orig_var.get(),
                     "conv_replace_orig":    self._conv_replace_orig_var.get(),
                     "conv_skip_processed":  self._conv_skip_processed_var.get(),
+                    "conv_skip_logged":     self._conv_skip_logged_var.get(),
                     "conv_parallel":        self._conv_parallel_var.get(),
                 })
 
@@ -451,6 +455,7 @@ class App(tk.Tk):
         self._conv_del_orig_var.set(    prefs.get("conv_del_orig",       False))
         self._conv_replace_orig_var.set(prefs.get("conv_replace_orig",  False))
         self._conv_skip_processed_var.set(prefs.get("conv_skip_processed", False))
+        self._conv_skip_logged_var.set( prefs.get("conv_skip_logged",    False))
         self._conv_parallel_var.set(    prefs.get("conv_parallel",       2))
 
         # Update preset description label
@@ -541,6 +546,81 @@ class App(tk.Tk):
             self._output_q.put("[history] Processing history cleared.\n")
         except Exception as e:
             self._output_q.put(f"[history] Could not clear history: {e}\n")
+
+    # ── Completed-from-logs (skip files marked [done] in a saved log) ──────────
+
+    def _load_completed_log(self) -> set:
+        """Load the persisted set of filenames previously marked done in logs."""
+        try:
+            if _DONE_LOG.exists():
+                return set(json.loads(_DONE_LOG.read_text(encoding="utf-8")))
+        except Exception:
+            pass
+        return set()
+
+    def _save_completed_log(self):
+        try:
+            _DONE_LOG.write_text(
+                json.dumps(sorted(self._log_completed), indent=0), encoding="utf-8")
+        except Exception:
+            pass
+
+    def _update_log_count_label(self):
+        if hasattr(self, "_conv_log_count_lbl"):
+            self._conv_log_count_lbl.configure(
+                text=f"({len(self._log_completed)} files)")
+
+    def _import_completed_log(self):
+        """Parse one or more log files for '[done] <filename>' lines and add those
+        filenames to the skip set.  Survives setting changes (CPU→GPU etc.) because
+        it matches on filename, not on the options hash."""
+        paths = filedialog.askopenfilenames(
+            title="Select previous run log file(s)",
+            filetypes=[("Log / text files", "*.log *.txt"), ("All files", "*.*")],
+        )
+        if not paths:
+            return
+        # Match: [done] <filename>   (filename runs until the double-space stats block)
+        done_re = re.compile(r"\[done\]\s+(.+?)(?:\s{2,}\d|\s*$)")
+        added = 0
+        for p in paths:
+            try:
+                text = Path(p).read_text(encoding="utf-8", errors="replace")
+            except Exception as e:
+                self._conv_log(f"[log-import] Could not read {p}: {e}")
+                continue
+            for line in text.splitlines():
+                m = done_re.search(line)
+                if m:
+                    name = m.group(1).strip()
+                    if name and name not in self._log_completed:
+                        self._log_completed.add(name)
+                        added += 1
+        self._save_completed_log()
+        self._update_log_count_label()
+        self._conv_log(
+            f"[log-import] Added {added} completed filename(s).  "
+            f"Total tracked: {len(self._log_completed)}.")
+        if added:
+            messagebox.showinfo(
+                "Log Imported",
+                f"Added {added} completed file(s) to the skip list.\n"
+                f"Total tracked: {len(self._log_completed)}.\n\n"
+                "Enable 'Skip files completed in imported logs' to use them.")
+        else:
+            messagebox.showinfo(
+                "Log Imported",
+                "No new '[done]' entries found in the selected file(s).")
+
+    def _clear_completed_log(self):
+        self._log_completed.clear()
+        try:
+            if _DONE_LOG.exists():
+                _DONE_LOG.unlink()
+        except Exception:
+            pass
+        self._update_log_count_label()
+        self._conv_log("[log-import] Cleared completed-from-logs list.")
 
     def _compute_tm_hash(self, keep_langs, remaps, manage_audio, audio_langs,
                          preferred_sub_lang, preferred_audio_lang, spell_check) -> str:
@@ -1372,6 +1452,19 @@ class App(tk.Tk):
         ttk.Checkbutton(optf, text="Skip already processed files",
                         variable=self._conv_skip_processed_var).pack(anchor="w", padx=8, pady=2)
 
+        # Skip files marked [done] in a previously-saved log (survives setting changes)
+        self._conv_skip_logged_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(optf, text="Skip files completed in imported logs",
+                        variable=self._conv_skip_logged_var).pack(anchor="w", padx=8, pady=2)
+        log_row = ttk.Frame(optf)
+        log_row.pack(fill="x", padx=8, pady=2)
+        ttk.Button(log_row, text="Import Log…", width=12,
+                   command=self._import_completed_log).pack(side="left")
+        ttk.Button(log_row, text="Clear", width=6,
+                   command=self._clear_completed_log).pack(side="left", padx=4)
+        self._conv_log_count_lbl = ttk.Label(log_row, text="(0 files)")
+        self._conv_log_count_lbl.pack(side="left", padx=4)
+
         par_row = ttk.Frame(optf)
         par_row.pack(fill="x", padx=8, pady=4)
         ttk.Label(par_row, text="Parallel jobs:").pack(side="left")
@@ -2116,6 +2209,8 @@ class App(tk.Tk):
         no_change      = s.get("no_change", False)
         skip_processed = s.get("skip_processed", False)
         conv_hash      = s.get("conv_hash", "")
+        skip_logged    = s.get("skip_logged", False)
+        log_completed  = s.get("log_completed", set())
 
         if n_parallel > 1:
             self._conv_log(
@@ -2144,6 +2239,14 @@ class App(tk.Tk):
                 info.status = "Skipped"
                 self._conv_log(
                     f"[no-change] {info.path.name}  (conversion skipped by preset)")
+                self.after(0, self._conv_refresh_row, info)
+                _inc_done()
+                return
+
+            # Skip if completed in an imported log (survives setting changes)
+            if skip_logged and info.path.name in log_completed:
+                info.status = "Skipped"
+                self._conv_log(f"[skip] {info.path.name}  (completed in imported log)")
                 self.after(0, self._conv_refresh_row, info)
                 _inc_done()
                 return
@@ -2320,6 +2423,8 @@ class App(tk.Tk):
             "replace_orig":      self._conv_replace_orig_var.get(),
             "skip_processed":    self._conv_skip_processed_var.get(),    # conv tab
             "tm_skip_processed": self._tm_skip_processed_var.get(),      # TM tab
+            "skip_logged":       self._conv_skip_logged_var.get(),
+            "log_completed":     set(self._log_completed),               # frozen copy
         }
         # Pre-compute hash from encode-relevant keys
         hash_keys = ("preset", "container", "vcodec", "crf", "enc_preset",
@@ -2547,6 +2652,8 @@ class App(tk.Tk):
         skip_compat      = s.get("skip_compat", True)
         no_change        = s.get("no_change", False)
         conv_hash        = s.get("conv_hash", "")
+        skip_logged      = s.get("skip_logged", False)
+        log_completed    = s.get("log_completed", set())
         time_re          = re.compile(r"time=(\d+):(\d+):(\d+)\.(\d+)")
         tm_hash          = self._compute_tm_hash(keep_langs, remaps, manage_audio,
                                                   audio_langs, preferred_sub_lang,
@@ -2585,6 +2692,11 @@ class App(tk.Tk):
             if _stopped():
                 break
             f = info.path
+            # Completed in an imported log → skip the whole pipeline for this file
+            if skip_logged and f.name in log_completed:
+                info.status = "Skipped"
+                self._output_q.put(f"[skip] {f.name}  (completed in imported log)\n")
+                continue
             if tm_skip_proc and not dry_run and self._history_check(f, tm_hash):
                 self._output_q.put(f"[TM skip] {f.name}\n")
                 continue
@@ -2619,7 +2731,7 @@ class App(tk.Tk):
             return
 
         # ── Phase 2: Parallel encoding ────────────────────────────────────────
-        encode_list = [f for f in files if f.status != "Error"]
+        encode_list = [f for f in files if f.status not in ("Error", "Skipped")]
         self._output_q.put(
             f"\n─── Phase 2 / Encoder × {n_parallel}  "
             f"({len(encode_list)} files) ─────────────────\n")
@@ -2839,6 +2951,8 @@ class App(tk.Tk):
         skip_compat      = s.get("skip_compat", True)
         no_change        = s.get("no_change", False)
         conv_hash        = s.get("conv_hash", "")
+        skip_logged      = s.get("skip_logged", False)
+        log_completed    = s.get("log_completed", set())
         time_re          = re.compile(r"time=(\d+):(\d+):(\d+)\.(\d+)")
         tm_hash          = self._compute_tm_hash(keep_langs, remaps, manage_audio,
                                                   audio_langs, preferred_sub_lang,
@@ -2866,6 +2980,12 @@ class App(tk.Tk):
         for info in files:
             if self._conv_stop_flag.is_set():
                 break
+            # Completed in an imported log → skip the whole pipeline for this file
+            if skip_logged and info.path.name in log_completed:
+                info.status = "Skipped"
+                self._conv_log(f"[skip] {info.path.name}  (completed in imported log)")
+                self.after(0, self._conv_refresh_row, info)
+                continue
             if info.path.suffix.lower() != ".mkv":
                 continue
             if tm_skip_proc and not dry_run \
@@ -2910,7 +3030,7 @@ class App(tk.Tk):
         # ── Phase 2: Parallel encoding ────────────────────────────────────────
         # Submit ALL non-error files to the pool at once.
         # ThreadPoolExecutor keeps exactly n_parallel workers busy at all times.
-        encode_list = [f for f in files if f.status != "Error"]
+        encode_list = [f for f in files if f.status not in ("Error", "Skipped")]
         self._conv_log(
             f"\n─── Phase 2 / Encoder × {n_parallel}  "
             f"({len(encode_list)} files) ─────────────────")
