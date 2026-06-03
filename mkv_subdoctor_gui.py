@@ -294,8 +294,10 @@ class App(tk.Tk):
         prefs = self._load_prefs()
         self._dark_mode = tk.BooleanVar(value=prefs.get("dark_mode", True))
 
+        self._prefs_ready = False    # blocks auto-save during startup
         self._build_ui()
         self._restore_prefs(prefs)   # re-apply saved widget states
+        self._prefs_ready = True     # allow auto-save from here on
         self._apply_theme()
         self._poll_output()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -433,6 +435,11 @@ class App(tk.Tk):
         # Update preset description label
         p = PRESETS.get(prefs.get("conv_preset", "Shield Optimal"), PRESETS["Custom"])
         self._conv_preset_desc_lbl.config(text=p["desc"])
+
+    def _save_prefs_if_ready(self):
+        """Save prefs only after startup is complete (avoids writes during restore)."""
+        if getattr(self, "_prefs_ready", False):
+            self._save_prefs()
 
     def _on_close(self):
         """Save all settings then close the window."""
@@ -1425,12 +1432,14 @@ class App(tk.Tk):
             self._custom_lang_entry.set("")
             messagebox.showinfo("Language Selected",
                 f"'{code}' is already in the list — checkbox ticked.")
+            self._save_prefs_if_ready()
             return
         if code not in self._custom_langs:
             self._custom_langs.add(code)
         self._custom_lang_entry.set("")
         self._custom_lang_display.configure(
             text="Custom: " + ", ".join(sorted(self._custom_langs)))
+        self._save_prefs_if_ready()
 
     def _get_keep_langs(self) -> frozenset[str]:
         langs = {code for code, var in self._lang_vars.items() if var.get()}
@@ -1444,6 +1453,7 @@ class App(tk.Tk):
     # ── Track Manager: audio helpers ──────────────────────────────────────────
 
     def _on_manage_audio_toggle(self):
+        self._save_prefs_if_ready()
         state = "normal" if self._manage_audio_var.get() else "disabled"
         for child in self._audio_opts_frm.winfo_children():
             try:
@@ -1466,10 +1476,12 @@ class App(tk.Tk):
         if code not in self._audio_lang_lb.get(0, "end"):
             self._audio_lang_lb.insert("end", code)
         self._audio_add_var.set("")
+        self._save_prefs_if_ready()
 
     def _audio_del_lang(self):
         for i in reversed(self._audio_lang_lb.curselection()):
             self._audio_lang_lb.delete(i)
+        self._save_prefs_if_ready()
 
     def _audio_match_subtitles(self):
         langs = sorted(code for code, var in self._lang_vars.items() if var.get())
@@ -1477,6 +1489,7 @@ class App(tk.Tk):
         self._audio_lang_lb.delete(0, "end")
         for lang in langs:
             self._audio_lang_lb.insert("end", lang)
+        self._save_prefs_if_ready()
 
     def _update_sub_primary_options(self):
         langs   = sorted(code for code, var in self._lang_vars.items() if var.get())
