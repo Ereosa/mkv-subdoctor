@@ -2302,6 +2302,47 @@ class App(tk.Tk):
 
     # ── Video Converter: replace-original helper ──────────────────────────────
 
+    def _conv_finalize_success(self, info: FileInfo, output: Path, s: dict,
+                                pre_size: int, pre_mtime: float, conv_hash: str) -> str:
+        """Called after a successful (ret==0) encode.  Decides whether to keep the
+        new file.  Returns the status string to assign ('Done' or 'Skipped').
+
+        BLOAT GUARD: if the new file is not actually smaller than the original,
+        the output is discarded and the ORIGINAL is left untouched — we never
+        replace/delete a file with something larger."""
+        out_mb = output.stat().st_size / 1_048_576 if output.exists() else 0.0
+        ratio  = out_mb / info.size_mb * 100 if info.size_mb else 0.0
+
+        # New file is not smaller → keep original, throw away the bloated output
+        if out_mb <= 0 or (info.size_mb > 0 and out_mb >= info.size_mb):
+            self._conv_log(
+                f"[kept original] {info.path.name}  "
+                f"{info.size_mb:.0f} MB → {out_mb:.0f} MB ({ratio:.0f}%) — "
+                f"not smaller, original left untouched")
+            try:
+                if output.exists():
+                    output.unlink()
+            except OSError:
+                pass
+            # Record so we don't keep retrying a file that only grows
+            self._history_record_at(info.path, pre_size, pre_mtime, conv_hash)
+            return "Skipped"
+
+        # New file is smaller → commit it
+        self._conv_log(
+            f"[done] {info.path.name}  "
+            f"{info.size_mb:.0f} MB → {out_mb:.0f} MB  ({ratio:.0f}%)")
+        self._history_record_at(info.path, pre_size, pre_mtime, conv_hash)
+        if s.get("replace_orig") and output.exists():
+            self._conv_do_replace_original(info, output)
+        elif s.get("del_orig") and output.exists():
+            try:
+                info.path.unlink()
+                self._conv_log("  [del] original removed")
+            except OSError:
+                pass
+        return "Done"
+
     def _conv_do_replace_original(self, info: FileInfo, output: Path) -> Path:
         """Delete the original file and move the encoded output into the original's
         FOLDER under the original stem (keeping the new extension).  Returns the
@@ -2597,18 +2638,8 @@ class App(tk.Tk):
 
                 if ret == 0 and not self._conv_stop_flag.is_set() \
                         and not self._conv_pause_flag.is_set():
-                    info.status = "Done"
-                    out_mb = output.stat().st_size / 1_048_576 if output.exists() else 0
-                    ratio  = out_mb / info.size_mb * 100 if info.size_mb else 0
-                    self._conv_log(
-                        f"[done] {info.path.name}  "
-                        f"{info.size_mb:.0f} MB → {out_mb:.0f} MB  ({ratio:.0f}%)")
-                    self._history_record_at(info.path, pre_size, pre_mtime, conv_hash)
-                    if s.get("replace_orig") and output.exists():
-                        output = self._conv_do_replace_original(info, output)
-                    elif s.get("del_orig") and output.exists():
-                        info.path.unlink()
-                        self._conv_log("  [del] original removed")
+                    info.status = self._conv_finalize_success(
+                        info, output, s, pre_size, pre_mtime, conv_hash)
                 elif self._conv_pause_flag.is_set():
                     # Reset so Resume re-processes this file from the start
                     info.status = "Pending"
@@ -3133,17 +3164,8 @@ class App(tk.Tk):
                             pass
 
                     if ret == 0 and not _stopped():
-                        out_mb = output.stat().st_size / 1_048_576 if output.exists() else 0
-                        ratio  = out_mb / info.size_mb * 100 if info.size_mb else 0
-                        self._conv_log(
-                            f"[done] {f.name}  "
-                            f"{info.size_mb:.0f} MB → {out_mb:.0f} MB  ({ratio:.0f}%)")
-                        self._history_record_at(f, pre_size, pre_mtime, conv_hash)
-                        if s.get("replace_orig") and output.exists():
-                            self._conv_do_replace_original(info, output)
-                        elif s.get("del_orig") and output.exists():
-                            f.unlink()
-                            self._conv_log("  [del] original removed")
+                        info.status = self._conv_finalize_success(
+                            info, output, s, pre_size, pre_mtime, conv_hash)
                     else:
                         self._conv_log(f"[fail] {f.name}  exit={ret}")
                         if output.exists():
@@ -3494,18 +3516,8 @@ class App(tk.Tk):
                             pass
 
                     if ret == 0 and not self._conv_stop_flag.is_set():
-                        info.status = "Done"
-                        out_mb = output.stat().st_size / 1_048_576 if output.exists() else 0
-                        ratio  = out_mb / info.size_mb * 100 if info.size_mb else 0
-                        self._conv_log(
-                            f"[done] {info.path.name}  "
-                            f"{info.size_mb:.0f} MB → {out_mb:.0f} MB  ({ratio:.0f}%)")
-                        self._history_record_at(info.path, pre_size, pre_mtime, conv_hash)
-                        if s.get("replace_orig") and output.exists():
-                            self._conv_do_replace_original(info, output)
-                        elif s.get("del_orig") and output.exists():
-                            info.path.unlink()
-                            self._conv_log("  [del] original removed")
+                        info.status = self._conv_finalize_success(
+                            info, output, s, pre_size, pre_mtime, conv_hash)
                     else:
                         info.status = "Cancelled" if self._conv_stop_flag.is_set() else "Error"
                         self._conv_log(f"[fail] {info.path.name}  exit={ret}")
