@@ -2588,11 +2588,16 @@ class App(tk.Tk):
             elif final_vcodec == "libsvtav1":
                 cmd += ["-crf", crf, "-preset", "6"]
             elif "nvenc" in final_vcodec:
-                cmd += ["-rc", "vbr", "-cq", crf, "-preset", "p4"]
+                # -b:v 0 is REQUIRED for true constant-quality mode on NVENC.
+                # Without it the encoder ignores -cq and targets a high default
+                # bitrate, producing files as large as (or larger than) the source.
+                # p5 = slower/better quality-per-bit than p4 (good on Ada/4070 Ti).
+                cmd += ["-rc", "vbr", "-cq", crf, "-b:v", "0",
+                        "-preset", "p5", "-tune", "hq"]
             elif "qsv" in final_vcodec:
                 cmd += ["-global_quality", crf, "-preset", "medium"]
             elif "amf" in final_vcodec:
-                cmd += ["-rc", "cqp", "-qp_i", crf, "-qp_p", crf]
+                cmd += ["-rc", "cqp", "-qp_i", crf, "-qp_p", crf, "-qp_b", crf]
 
         is_hevc = final_vcodec in ("libx265", "hevc_nvenc", "hevc_qsv", "hevc_amf")
         is_av1  = "av1" in final_vcodec
@@ -2813,49 +2818,54 @@ class App(tk.Tk):
             self.after(0, self._combined_on_done)
             return
 
-        # ── Pipeline: one TM producer feeds a queue; N encoders drain it ──────
-        # Encoding starts as soon as the FIRST file clears Track Manager and
-        # overlaps TM of the rest — no waiting for all TM to finish first.
+        # ── Self-serve workers: N threads, each TM (under lock) then encode ───
+        # TM must serialize (contextlib.redirect_stdout is process-global), but
+        # encodes run in parallel.  Each worker grabs the next file itself, so a
+        # slow TM never starves the other encoders the way a single producer did.
         self._output_q.put(
-            f"─── TM → Encoder pipeline (×{n_parallel}) ───────────────────────\n")
-        enc_q: queue.Queue = queue.Queue()
+            f"─── TM → Encoder  ({n_parallel} parallel workers) ──────────────\n")
+        tm_lock   = threading.Lock()
+        work_idx  = [0]
+        work_lock = threading.Lock()
 
-        def _tm_producer():
-            for info in files:
-                if _stopped():
-                    break
-                f = info.path
-                # Completed in an imported log → skip the whole pipeline
-                if skip_logged and f.name in log_completed:
-                    info.status = "Skipped"
-                    self._output_q.put(f"[skip] {f.name}  (completed in imported log)\n")
-                    _inc_done()
-                    continue
-                # Track Manager step (skip if already done — file still encodes)
-                if tm_skip_proc and self._history_check(f, tm_hash):
-                    self._output_q.put(f"[TM skip] {f.name}\n")
-                else:
-                    self._output_q.put(f"[TM] {f.name}\n")
-                    try:
-                        with contextlib.redirect_stdout(stream):
-                            changed = core.process_mkv(
-                                str(f), dry_run=False, remap_langs=remaps,
-                                keep_langs=keep_langs, spell_check=spell_check,
-                                manage_audio=manage_audio, audio_langs=audio_langs,
-                                preferred_sub_lang=preferred_sub_lang,
-                                preferred_audio_lang=preferred_audio_lang,
-                            )
-                        if changed:
-                            tm_changed[0] += 1
-                        self._history_record(f, tm_hash)
-                    except Exception as exc:
-                        self._output_q.put(f"  TM ERROR {f.name}: {exc}\n")
-                        info.status = "Error"
-                        _inc_done()
-                        continue
-                enc_q.put(info)   # hand off to an encoder immediately
-            for _ in range(n_parallel):
-                enc_q.put(None)   # shutdown sentinels (one per encoder)
+        def _next_file():
+            with work_lock:
+                i = work_idx[0]
+                if i >= len(files):
+                    return None
+                work_idx[0] += 1
+                return files[i]
+
+        def _tm_one(info: FileInfo) -> str:
+            """Run the Track Manager step (serialized).  Returns 'encode' or 'skip'.
+            Does NOT call _inc_done — the caller handles that."""
+            f = info.path
+            if skip_logged and f.name in log_completed:
+                info.status = "Skipped"
+                self._output_q.put(f"[skip] {f.name}  (completed in imported log)\n")
+                return "skip"
+            if tm_skip_proc and self._history_check(f, tm_hash):
+                self._output_q.put(f"[TM skip] {f.name}\n")
+                return "encode"
+            self._output_q.put(f"[TM] {f.name}\n")
+            try:
+                with tm_lock:
+                    with contextlib.redirect_stdout(stream):
+                        changed = core.process_mkv(
+                            str(f), dry_run=False, remap_langs=remaps,
+                            keep_langs=keep_langs, spell_check=spell_check,
+                            manage_audio=manage_audio, audio_langs=audio_langs,
+                            preferred_sub_lang=preferred_sub_lang,
+                            preferred_audio_lang=preferred_audio_lang,
+                        )
+                    if changed:
+                        tm_changed[0] += 1
+                    self._history_record(f, tm_hash)
+                return "encode"
+            except Exception as exc:
+                self._output_q.put(f"  TM ERROR {f.name}: {exc}\n")
+                info.status = "Error"
+                return "skip"
 
         def _encode_file(info: FileInfo):
             try:
@@ -2966,21 +2976,22 @@ class App(tk.Tk):
                 self._conv_log(f"[err] {info.path.name}: unexpected — {exc}")
                 _inc_done()
 
-        def _encoder_consumer():
-            while True:
-                info = enc_q.get()
+        def _worker():
+            while not _stopped():
+                info = _next_file()
                 if info is None:
                     break
-                _encode_file(info)
+                action = _tm_one(info)
+                if action == "encode" and not _stopped():
+                    _encode_file(info)   # calls _inc_done() on every path
+                else:
+                    _inc_done()          # skipped / TM-errored
 
-        tm_thread = threading.Thread(target=_tm_producer, daemon=True)
-        enc_threads = [threading.Thread(target=_encoder_consumer, daemon=True)
-                       for _ in range(n_parallel)]
-        tm_thread.start()
-        for t in enc_threads:
+        threads = [threading.Thread(target=_worker, daemon=True)
+                   for _ in range(n_parallel)]
+        for t in threads:
             t.start()
-        tm_thread.join()
-        for t in enc_threads:
+        for t in threads:
             t.join()
 
         sep = "=" * 60
@@ -3137,56 +3148,58 @@ class App(tk.Tk):
             self.after(0, self._combined_on_done_conv)
             return
 
-        # ── Pipeline: TM producer feeds a queue; N encoders drain it ──────────
+        # ── Self-serve workers: N threads, each TM (under lock) then encode ───
         self._conv_log(
-            f"\n─── TM → Encoder pipeline (×{n_parallel}) ───────────────────────")
-        enc_q: queue.Queue = queue.Queue()
+            f"\n─── TM → Encoder  ({n_parallel} parallel workers) ──────────────")
+        tm_lock   = threading.Lock()
+        work_idx  = [0]
+        work_lock = threading.Lock()
 
-        def _tm_producer():
-            for info in files:
-                if self._conv_stop_flag.is_set():
-                    break
-                # Completed in an imported log → skip the whole pipeline
-                if skip_logged and info.path.name in log_completed:
-                    info.status = "Skipped"
-                    self._conv_log(f"[skip] {info.path.name}  (completed in imported log)")
-                    self.after(0, self._conv_refresh_row, info)
-                    _inc_done()
-                    continue
-                # Non-MKV → no Track Manager step, encode directly
-                if info.path.suffix.lower() != ".mkv":
-                    enc_q.put(info)
-                    continue
-                if tm_skip_proc and self._history_check(info.path, tm_hash):
-                    self._output_q.put(f"[TM skip] {info.path.name}\n")
-                else:
-                    info.status = "TM Clean…"
-                    self.after(0, self._conv_refresh_row, info)
-                    self._output_q.put(f"[TM] {info.path.name}\n")
-                    try:
-                        with contextlib.redirect_stdout(stream):
-                            changed = core.process_mkv(
-                                str(info.path), dry_run=False,
-                                remap_langs=remaps, keep_langs=keep_langs,
-                                spell_check=spell_check, manage_audio=manage_audio,
-                                audio_langs=audio_langs,
-                                preferred_sub_lang=preferred_sub_lang,
-                                preferred_audio_lang=preferred_audio_lang,
-                            )
-                        if changed:
-                            tm_changed[0] += 1
-                        self._history_record(info.path, tm_hash)
-                        info.status = "Pending"
-                        self.after(0, self._conv_refresh_row, info)
-                    except Exception as exc:
-                        self._output_q.put(f"  TM ERROR {info.path.name}: {exc}\n")
-                        info.status = "Error"
-                        self.after(0, self._conv_refresh_row, info)
-                        _inc_done()
-                        continue
-                enc_q.put(info)   # hand off to an encoder immediately
-            for _ in range(n_parallel):
-                enc_q.put(None)   # shutdown sentinels
+        def _next_file():
+            with work_lock:
+                i = work_idx[0]
+                if i >= len(files):
+                    return None
+                work_idx[0] += 1
+                return files[i]
+
+        def _tm_one(info: FileInfo) -> str:
+            """Run the Track Manager step (serialized).  Returns 'encode' or 'skip'."""
+            if skip_logged and info.path.name in log_completed:
+                info.status = "Skipped"
+                self._conv_log(f"[skip] {info.path.name}  (completed in imported log)")
+                self.after(0, self._conv_refresh_row, info)
+                return "skip"
+            if info.path.suffix.lower() != ".mkv":
+                return "encode"   # no TM step for non-MKV; still encode
+            if tm_skip_proc and self._history_check(info.path, tm_hash):
+                self._output_q.put(f"[TM skip] {info.path.name}\n")
+                return "encode"
+            info.status = "TM Clean…"
+            self.after(0, self._conv_refresh_row, info)
+            self._output_q.put(f"[TM] {info.path.name}\n")
+            try:
+                with tm_lock:
+                    with contextlib.redirect_stdout(stream):
+                        changed = core.process_mkv(
+                            str(info.path), dry_run=False,
+                            remap_langs=remaps, keep_langs=keep_langs,
+                            spell_check=spell_check, manage_audio=manage_audio,
+                            audio_langs=audio_langs,
+                            preferred_sub_lang=preferred_sub_lang,
+                            preferred_audio_lang=preferred_audio_lang,
+                        )
+                    if changed:
+                        tm_changed[0] += 1
+                    self._history_record(info.path, tm_hash)
+                info.status = "Pending"
+                self.after(0, self._conv_refresh_row, info)
+                return "encode"
+            except Exception as exc:
+                self._output_q.put(f"  TM ERROR {info.path.name}: {exc}\n")
+                info.status = "Error"
+                self.after(0, self._conv_refresh_row, info)
+                return "skip"
 
         def _encode_file(info: FileInfo):
             try:
@@ -3322,21 +3335,22 @@ class App(tk.Tk):
                 self.after(0, self._conv_refresh_row, info)
                 _inc_done()
 
-        def _encoder_consumer():
-            while True:
-                info = enc_q.get()
+        def _worker():
+            while not self._conv_stop_flag.is_set():
+                info = _next_file()
                 if info is None:
                     break
-                _encode_file(info)
+                action = _tm_one(info)
+                if action == "encode" and not self._conv_stop_flag.is_set():
+                    _encode_file(info)   # calls _inc_done() on every path
+                else:
+                    _inc_done()          # skipped / TM-errored
 
-        tm_thread = threading.Thread(target=_tm_producer, daemon=True)
-        enc_threads = [threading.Thread(target=_encoder_consumer, daemon=True)
-                       for _ in range(n_parallel)]
-        tm_thread.start()
-        for t in enc_threads:
+        threads = [threading.Thread(target=_worker, daemon=True)
+                   for _ in range(n_parallel)]
+        for t in threads:
             t.start()
-        tm_thread.join()
-        for t in enc_threads:
+        for t in threads:
             t.join()
 
         counts = {st: sum(1 for f in files if f.status == st)
