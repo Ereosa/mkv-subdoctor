@@ -1272,12 +1272,25 @@ class App(tk.Tk):
     def _build_video_converter_tab(self, parent):
         parent.columnconfigure(0, weight=1)
         parent.rowconfigure(0, weight=0)   # toolbar
-        parent.rowconfigure(1, weight=1)   # paned window (file list + settings)
-        parent.rowconfigure(2, weight=0)   # log panel
+        parent.rowconfigure(1, weight=1)   # vertical paned (files/settings  |  log)
 
         self._build_conv_toolbar(parent)
-        self._build_conv_paned(parent)
-        self._build_conv_log(parent)
+
+        # Vertical splitter — drag the sash to resize the log area
+        vpw = ttk.PanedWindow(parent, orient="vertical")
+        vpw.grid(row=1, column=0, sticky="nsew", padx=5, pady=(0, 5))
+
+        top = ttk.Frame(vpw)
+        top.columnconfigure(0, weight=1)
+        top.rowconfigure(0, weight=1)
+        vpw.add(top, weight=3)
+        self._build_conv_paned(top)
+
+        bottom = ttk.Frame(vpw)
+        bottom.columnconfigure(0, weight=1)
+        bottom.rowconfigure(0, weight=1)
+        vpw.add(bottom, weight=2)
+        self._build_conv_log(bottom)
 
     def _build_conv_toolbar(self, parent):
         bar = ttk.Frame(parent, padding=(6, 6))
@@ -1322,7 +1335,7 @@ class App(tk.Tk):
 
     def _build_conv_paned(self, parent):
         pw = ttk.PanedWindow(parent, orient="horizontal")
-        pw.grid(row=1, column=0, sticky="nsew", padx=6, pady=(0, 4))
+        pw.grid(row=0, column=0, sticky="nsew", padx=1, pady=0)
 
         self._build_conv_file_panel(pw)
         self._build_conv_settings_panel(pw)
@@ -1566,18 +1579,108 @@ class App(tk.Tk):
         self._conv_apply_preset()
 
     def _build_conv_log(self, parent):
-        lf = ttk.LabelFrame(parent, text="Log", padding=(4, 4))
-        lf.grid(row=2, column=0, sticky="ew", padx=6, pady=(0, 6))
+        lf = ttk.LabelFrame(parent, text="Activity Log", padding=(4, 4))
+        lf.grid(row=0, column=0, sticky="nsew")
         lf.columnconfigure(0, weight=1)
+        lf.rowconfigure(1, weight=1)
 
+        # Control row
+        ctl = ttk.Frame(lf)
+        ctl.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 4))
+        self._conv_autoscroll_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(ctl, text="Auto-scroll",
+                        variable=self._conv_autoscroll_var).pack(side="left", padx=(2, 8))
+        ttk.Button(ctl, text="Copy All",     width=9,
+                   command=self._conv_log_copy_all).pack(side="left", padx=2)
+        ttk.Button(ctl, text="Copy Results", width=12,
+                   command=self._conv_log_copy_results).pack(side="left", padx=2)
+        ttk.Button(ctl, text="Save…",        width=7,
+                   command=self._conv_log_save).pack(side="left", padx=2)
+        ttk.Button(ctl, text="Clear",        width=7,
+                   command=self._conv_log_clear).pack(side="left", padx=2)
+        self._conv_log_count = ttk.Label(ctl, text="")
+        self._conv_log_count.pack(side="right", padx=4)
+
+        # Log text — monospace, no word-wrap (so long filenames stay on one line),
+        # with both scrollbars.  Kept readable & selectable.
         self._conv_log_text = tk.Text(
-            lf, height=7, font=("Consolas", 8), state="disabled",
-            wrap="word", relief="flat",
+            lf, height=14, font=("Consolas", 9), wrap="none", relief="flat",
+            undo=False,
         )
-        ls = ttk.Scrollbar(lf, orient="vertical", command=self._conv_log_text.yview)
-        self._conv_log_text.configure(yscrollcommand=ls.set)
-        self._conv_log_text.pack(side="left", fill="both", expand=True, padx=(0, 0), pady=2)
-        ls.pack(side="right", fill="y", pady=2, padx=(0, 0))
+        ls = ttk.Scrollbar(lf, orient="vertical",   command=self._conv_log_text.yview)
+        lh = ttk.Scrollbar(lf, orient="horizontal", command=self._conv_log_text.xview)
+        self._conv_log_text.configure(yscrollcommand=ls.set, xscrollcommand=lh.set)
+        self._conv_log_text.grid(row=1, column=0, sticky="nsew")
+        ls.grid(row=1, column=1, sticky="ns")
+        lh.grid(row=2, column=0, sticky="ew")
+
+        # Read-only but fully selectable/copyable: block typed edits, keep
+        # Ctrl+C / Ctrl+A and all navigation keys working.
+        def _readonly(e):
+            if e.state & 0x4 and e.keysym.lower() in ("c", "a"):
+                return None
+            if e.keysym in ("Left", "Right", "Up", "Down", "Home", "End",
+                            "Prior", "Next", "Shift_L", "Shift_R",
+                            "Control_L", "Control_R"):
+                return None
+            return "break"
+        self._conv_log_text.bind("<Key>", _readonly)
+
+        # Colour tags for quick scanning
+        self._conv_log_text.tag_configure("done",  foreground="#a6e3a1")
+        self._conv_log_text.tag_configure("skip",  foreground="#6c7086")
+        self._conv_log_text.tag_configure("start", foreground="#89b4fa")
+        self._conv_log_text.tag_configure("err",   foreground="#f38ba8")
+
+        # Never-trimmed buffer of completion results, for "Copy Results"
+        self._conv_results: list[str] = []
+        self._conv_log_lines = 0   # visible line counter (for trimming)
+
+    # ── Video Converter: log controls ─────────────────────────────────────────
+
+    def _conv_log_copy_all(self):
+        try:
+            txt = self._conv_log_text.get("1.0", "end-1c")
+            self.clipboard_clear()
+            self.clipboard_append(txt)
+            self._flash_log_count("Copied all")
+        except Exception:
+            pass
+
+    def _conv_log_copy_results(self):
+        """Copy every [done]/[skip]/[fail] result line collected this session —
+        complete even if the visible log was trimmed or cleared."""
+        try:
+            self.clipboard_clear()
+            self.clipboard_append("\n".join(self._conv_results))
+            self._flash_log_count(f"Copied {len(self._conv_results)} results")
+        except Exception:
+            pass
+
+    def _conv_log_save(self):
+        path = filedialog.asksaveasfilename(
+            title="Save activity log",
+            defaultextension=".txt",
+            filetypes=[("Text file", "*.txt"), ("Log file", "*.log"), ("All files", "*.*")],
+            initialfile="mkv_subdoctor_run.log",
+        )
+        if not path:
+            return
+        try:
+            Path(path).write_text(
+                self._conv_log_text.get("1.0", "end-1c"), encoding="utf-8")
+            self._flash_log_count("Saved")
+        except Exception as e:
+            messagebox.showerror("Save failed", str(e))
+
+    def _conv_log_clear(self):
+        self._conv_log_text.delete("1.0", "end")
+        self._conv_log_lines = 0
+        # _conv_results kept on purpose — Copy Results still works after Clear
+
+    def _flash_log_count(self, msg: str):
+        self._conv_log_count.configure(text=msg)
+        self.after(2000, lambda: self._conv_log_count.configure(text=""))
 
     # ── BMC image loader ──────────────────────────────────────────────────────
 
@@ -1779,15 +1882,41 @@ class App(tk.Tk):
             pass
 
         # --- Video Converter log queue ---
+        appended = False
         try:
             while True:
                 msg = self._conv_log_q.get_nowait()
-                self._conv_log_text.configure(state="normal")
-                self._conv_log_text.insert("end", msg + "\n")
-                self._conv_log_text.see("end")
-                self._conv_log_text.configure(state="disabled")
+                # Colour tag based on the line's leading marker
+                stripped = msg.lstrip()
+                tag = ()
+                if stripped.startswith("[done]"):
+                    tag = ("done",)
+                    self._conv_results.append(msg.strip())
+                elif stripped.startswith("[skip]") or stripped.startswith("[TM skip]") \
+                        or stripped.startswith("[no-change]"):
+                    tag = ("skip",)
+                    self._conv_results.append(msg.strip())
+                elif stripped.startswith("[start]"):
+                    tag = ("start",)
+                elif stripped.startswith(("[fail]", "[err]", "[error]")):
+                    tag = ("err",)
+                    self._conv_results.append(msg.strip())
+
+                self._conv_log_text.insert("end", msg + "\n", tag)
+                self._conv_log_lines += 1
+                appended = True
         except queue.Empty:
             pass
+
+        if appended:
+            # Trim the visible widget to keep the UI responsive on huge runs
+            # (Copy Results / the saved log keep the full picture).
+            if self._conv_log_lines > 8000:
+                remove = self._conv_log_lines - 6000
+                self._conv_log_text.delete("1.0", f"{remove + 1}.0")
+                self._conv_log_lines -= remove
+            if self._conv_autoscroll_var.get():
+                self._conv_log_text.see("end")
 
         self.after(100, self._poll_output)
 
