@@ -266,9 +266,20 @@ class FileInfo:
     resolution:  str  = "—"
     duration:    float = 0.0
     size_mb:     float = 0.0
+    bitrate_kbps: float = 0.0    # overall source bitrate (from ffprobe)
     status:      str  = "Pending"
     progress:    float = 0.0
     row_id:      str  = ""
+
+    @property
+    def source_kbps(self) -> float:
+        """Best estimate of source bitrate in kbps.  Uses the probed format
+        bitrate, falling back to size/duration when ffprobe didn't report it."""
+        if self.bitrate_kbps > 0:
+            return self.bitrate_kbps
+        if self.duration > 0 and self.size_mb > 0:
+            return self.size_mb * 8 * 1024 / self.duration
+        return 0.0
 
     @property
     def is_plex_compatible(self) -> bool:
@@ -422,6 +433,7 @@ class App(tk.Tk):
                     "conv_skip_processed":  self._conv_skip_processed_var.get(),
                     "conv_skip_logged":     self._conv_skip_logged_var.get(),
                     "conv_parallel":        self._conv_parallel_var.get(),
+                    "conv_min_mbps":        self._conv_min_mbps_var.get(),
                 })
 
             _CONFIG.write_text(json.dumps(prefs, indent=2), encoding="utf-8")
@@ -500,6 +512,7 @@ class App(tk.Tk):
         self._conv_skip_processed_var.set(prefs.get("conv_skip_processed", False))
         self._conv_skip_logged_var.set( prefs.get("conv_skip_logged",    False))
         self._conv_parallel_var.set(    prefs.get("conv_parallel",       2))
+        self._conv_min_mbps_var.set(    prefs.get("conv_min_mbps",       2.5))
 
         # Update preset description label
         p = PRESETS.get(prefs.get("conv_preset", "Shield Optimal"), PRESETS["Custom"])
@@ -1575,6 +1588,16 @@ class App(tk.Tk):
                     textvariable=self._conv_parallel_var).pack(side="left", padx=6)
         ttk.Label(par_row, text="(4070 Ti sweet spot: 2–3)").pack(side="left")
 
+        # Minimum source bitrate — below this a file is already small enough that
+        # re-encoding can only bloat it, so skip it.
+        mb_row = ttk.Frame(optf)
+        mb_row.pack(fill="x", padx=8, pady=4)
+        ttk.Label(mb_row, text="Skip sources under:").pack(side="left")
+        self._conv_min_mbps_var = tk.DoubleVar(value=2.5)
+        ttk.Spinbox(mb_row, from_=0.0, to=50.0, increment=0.5, width=5,
+                    textvariable=self._conv_min_mbps_var).pack(side="left", padx=6)
+        ttk.Label(mb_row, text="Mbps  (0 = never skip)").pack(side="left")
+
         # Apply initial preset
         self._conv_apply_preset()
 
@@ -2212,6 +2235,10 @@ class App(tk.Tk):
 
             fmt           = data.get("format", {})
             info.duration = float(fmt.get("duration", 0))
+            try:
+                info.bitrate_kbps = float(fmt.get("bit_rate", 0)) / 1000.0
+            except (TypeError, ValueError):
+                info.bitrate_kbps = 0.0
             self.after(0, self._conv_refresh_row, info)
         except json.JSONDecodeError as e:
             self._conv_log(f"Probe error (bad JSON) — {info.path.name}: {e}")
@@ -2246,6 +2273,10 @@ class App(tk.Tk):
                     info.audio_codec = stream.get("codec_name", "?")
             fmt           = data.get("format", {})
             info.duration = float(fmt.get("duration", 0))
+            try:
+                info.bitrate_kbps = float(fmt.get("bit_rate", 0)) / 1000.0
+            except (TypeError, ValueError):
+                info.bitrate_kbps = 0.0
         except Exception:
             pass  # duration stays 0; progress won't show percentage
 
@@ -2498,6 +2529,17 @@ class App(tk.Tk):
                 _inc_done()
                 return
 
+            # Skip already-low-bitrate sources — re-encoding can only bloat them
+            _min_kbps = s.get("min_kbps", 0)
+            if _min_kbps > 0 and 0 < info.source_kbps < _min_kbps:
+                info.status = "Skipped"
+                self._conv_log(
+                    f"[skip] {info.path.name}  "
+                    f"(already small: {info.source_kbps/1000:.1f} Mbps)")
+                self.after(0, self._conv_refresh_row, info)
+                _inc_done()
+                return
+
             output = self._conv_output_path(info, s)
             if output.exists() and not s.get("overwrite"):
                 info.status = "Skipped"
@@ -2653,6 +2695,7 @@ class App(tk.Tk):
             "tm_skip_processed": self._tm_skip_processed_var.get(),      # TM tab
             "skip_logged":       self._conv_skip_logged_var.get(),
             "log_completed":     set(self._log_completed),               # frozen copy
+            "min_kbps":          float(self._conv_min_mbps_var.get()) * 1000.0,
         }
         # Target-aware skip: rank of the chosen output video codec
         s["target_vrank"] = _target_vrank(s["vcodec"])
@@ -2727,6 +2770,15 @@ class App(tk.Tk):
                 cmd += ["-global_quality", crf, "-preset", "medium"]
             elif "amf" in final_vcodec:
                 cmd += ["-rc", "cqp", "-qp_i", crf, "-qp_p", crf, "-qp_b", crf]
+
+            # Bitrate ceiling: never let the output exceed the source bitrate.
+            # Constant-quality (CQ/CRF) can request MORE bits than a low-bitrate
+            # source used, bloating the file.  Capping at the source bitrate keeps
+            # CQ for the quality target while guaranteeing the file can't grow.
+            src_kbps = info.source_kbps
+            if src_kbps > 0:
+                cap = int(src_kbps)            # kbps
+                cmd += ["-maxrate", f"{cap}k", "-bufsize", f"{cap * 2}k"]
 
         is_hevc = final_vcodec in ("libx265", "hevc_nvenc", "hevc_qsv", "hevc_amf")
         is_av1  = "av1" in final_vcodec
@@ -2886,6 +2938,7 @@ class App(tk.Tk):
         conv_skip_proc   = s.get("skip_processed", False)
         skip_compat      = s.get("skip_compat", True)
         target_vrank     = s.get("target_vrank", 0)
+        min_kbps         = s.get("min_kbps", 0)
         no_change        = s.get("no_change", False)
         conv_hash        = s.get("conv_hash", "")
         skip_logged      = s.get("skip_logged", False)
@@ -3019,6 +3072,12 @@ class App(tk.Tk):
                     self._conv_log(
                         f"[skip] {f.name}  "
                         f"(already ≥ target codec: {info.video_codec}/{info.audio_codec})")
+                    _inc_done()
+                    return
+
+                if min_kbps > 0 and 0 < info.source_kbps < min_kbps:
+                    self._conv_log(
+                        f"[skip] {f.name}  (already small: {info.source_kbps/1000:.1f} Mbps)")
                     _inc_done()
                     return
 
@@ -3224,6 +3283,7 @@ class App(tk.Tk):
         conv_skip_proc   = s.get("skip_processed", False)
         skip_compat      = s.get("skip_compat", True)
         target_vrank     = s.get("target_vrank", 0)
+        min_kbps         = s.get("min_kbps", 0)
         no_change        = s.get("no_change", False)
         conv_hash        = s.get("conv_hash", "")
         skip_logged      = s.get("skip_logged", False)
@@ -3361,6 +3421,15 @@ class App(tk.Tk):
                     self._conv_log(
                         f"[skip] {info.path.name}  "
                         f"(already ≥ target codec: {info.video_codec}/{info.audio_codec})")
+                    self.after(0, self._conv_refresh_row, info)
+                    _inc_done()
+                    return
+
+                if min_kbps > 0 and 0 < info.source_kbps < min_kbps:
+                    info.status = "Skipped"
+                    self._conv_log(
+                        f"[skip] {info.path.name}  "
+                        f"(already small: {info.source_kbps/1000:.1f} Mbps)")
                     self.after(0, self._conv_refresh_row, info)
                     _inc_done()
                     return
