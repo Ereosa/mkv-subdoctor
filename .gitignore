@@ -39,3 +39,6 @@ Subtitle_Manager_logs/
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# MKV SubDoctor local scratch (transient encode files)
+mkv_work/

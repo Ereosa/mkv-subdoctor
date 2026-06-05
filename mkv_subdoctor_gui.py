@@ -270,6 +270,7 @@ class FileInfo:
     status:      str  = "Pending"
     progress:    float = 0.0
     row_id:      str  = ""
+    work_path:   Optional[Path] = None   # local scratch copy while staged
 
     @property
     def source_kbps(self) -> float:
@@ -434,6 +435,7 @@ class App(tk.Tk):
                     "conv_skip_logged":     self._conv_skip_logged_var.get(),
                     "conv_parallel":        self._conv_parallel_var.get(),
                     "conv_min_mbps":        self._conv_min_mbps_var.get(),
+                    "conv_local_work":      self._conv_local_work_var.get(),
                 })
 
             _CONFIG.write_text(json.dumps(prefs, indent=2), encoding="utf-8")
@@ -513,6 +515,7 @@ class App(tk.Tk):
         self._conv_skip_logged_var.set( prefs.get("conv_skip_logged",    False))
         self._conv_parallel_var.set(    prefs.get("conv_parallel",       2))
         self._conv_min_mbps_var.set(    prefs.get("conv_min_mbps",       2.5))
+        self._conv_local_work_var.set(  prefs.get("conv_local_work",     ""))
 
         # Update preset description label
         p = PRESETS.get(prefs.get("conv_preset", "Shield Optimal"), PRESETS["Custom"])
@@ -1598,6 +1601,23 @@ class App(tk.Tk):
                     textvariable=self._conv_min_mbps_var).pack(side="left", padx=6)
         ttk.Label(mb_row, text="Mbps  (0 = never skip)").pack(side="left")
 
+        # Local work folder — copy each file to fast local disk, process there,
+        # then copy the result back.  Minimises exposure to a slow/flaky network
+        # drive (source on a server, GPU on this workstation).
+        ttk.Label(optf, text="Local work folder (copy-local processing):").pack(
+            anchor="w", padx=8, pady=(6, 0))
+        lw_row = ttk.Frame(optf)
+        lw_row.pack(fill="x", padx=8, pady=(0, 4))
+        self._conv_local_work_var = tk.StringVar(value="")
+        ttk.Entry(lw_row, textvariable=self._conv_local_work_var).pack(
+            side="left", fill="x", expand=True, padx=(0, 4))
+        ttk.Button(lw_row, text="Browse",
+                   command=self._conv_browse_local_work).pack(side="left", padx=2)
+        ttk.Button(lw_row, text="Off", width=4,
+                   command=lambda: self._conv_local_work_var.set("")).pack(side="left")
+        ttk.Label(optf, text="(empty = process directly over the network)",
+                  font=("Segoe UI", 8)).pack(anchor="w", padx=8)
+
         # Apply initial preset
         self._conv_apply_preset()
 
@@ -2195,6 +2215,11 @@ class App(tk.Tk):
         if d:
             self._conv_output_var.set(d)
 
+    def _conv_browse_local_work(self):
+        d = filedialog.askdirectory(title="Choose local work folder (fast local disk)")
+        if d:
+            self._conv_local_work_var.set(d)
+
     def _conv_sort_tree(self, col: str):
         items = [(self._conv_tree.set(k, col), k)
                  for k in self._conv_tree.get_children("")]
@@ -2329,6 +2354,121 @@ class App(tk.Tk):
             pass
         return True
 
+    # ── Local work folder (copy-local processing) ──────────────────────────────
+
+    def _stage_in(self, info: FileInfo, s: dict) -> bool:
+        """If a local work folder is configured, copy the source there so all
+        heavy I/O (TM + encode) happens on fast local disk instead of over a
+        slow/flaky network drive.  Sets info.work_path.  Returns False on failure."""
+        work_dir = s.get("local_work", "")
+        if not work_dir:
+            info.work_path = None
+            return True
+        try:
+            wd = Path(work_dir)
+            wd.mkdir(parents=True, exist_ok=True)
+            dst = wd / info.path.name
+            shutil.copy2(info.path, dst)        # one bulk sequential read
+            info.work_path = dst
+            self._conv_log(f"  [local] staged → {dst.name}")
+            return True
+        except Exception as exc:
+            self._conv_log(f"  [local] copy-in failed: {exc}")
+            self._note_drive_loss(exc)
+            info.work_path = None
+            return False
+
+    def _stage_cleanup(self, info: FileInfo):
+        """Remove the local scratch copy of the source (and any sibling temp)."""
+        if info.work_path:
+            try:
+                if info.work_path.exists():
+                    info.work_path.unlink()
+            except OSError:
+                pass
+            info.work_path = None
+
+    def _sweep_work_folder(self, s: dict):
+        """Clear leftover scratch files from a previous interrupted run.
+        Only removes video files in the configured work folder."""
+        wd = s.get("local_work", "")
+        if not wd:
+            return
+        try:
+            p = Path(wd)
+            if not p.is_dir():
+                return
+            n = 0
+            for f in p.iterdir():
+                if f.is_file() and f.suffix.lower() in VIDEO_EXTENSIONS:
+                    try:
+                        f.unlink()
+                        n += 1
+                    except OSError:
+                        pass
+            if n:
+                self._conv_log(f"[local] cleared {n} stale scratch file(s) from {wd}")
+        except Exception:
+            pass
+
+    def _safe_unlink_retry(self, path: Path, tries: int = 6, delay: int = 5) -> bool:
+        for attempt in range(tries):
+            try:
+                path.unlink()
+                return True
+            except FileNotFoundError:
+                return True
+            except OSError as e:
+                if attempt < tries - 1:
+                    self._conv_log(f"  [retry {attempt + 1}/{tries - 1}] delete locked — "
+                                   f"waiting {delay}s…")
+                    time.sleep(delay)
+                else:
+                    self._conv_log(f"  [err] delete failed: {e}")
+                    self._note_drive_loss(e)
+        return False
+
+    def _safe_move_retry(self, src: Path, dst: Path,
+                         tries: int = 6, delay: int = 5) -> Path:
+        """shutil.move with retry — handles same-drive (atomic) and cross-drive
+        (local→network copy) plus transient Plex/AV locks."""
+        for attempt in range(tries):
+            try:
+                shutil.move(str(src), str(dst))
+                self._conv_log(f"  [moved] {src.name} → {dst}")
+                return dst
+            except OSError as e:
+                if attempt < tries - 1:
+                    self._conv_log(f"  [retry {attempt + 1}/{tries - 1}] move locked — "
+                                   f"waiting {delay}s…")
+                    time.sleep(delay)
+                else:
+                    self._conv_log(f"  [err] move failed: {e}")
+                    self._note_drive_loss(e)
+        return src
+
+    def _commit_to_network(self, info: FileInfo, output: Path, s: dict) -> Path:
+        """Place the finished file at its final NETWORK location and handle the
+        original per replace/del settings.  Works for both local-staged output
+        (cross-drive copy back) and in-place network output."""
+        src_folder = info.path.parent
+        if s.get("replace_orig") or s.get("del_orig"):
+            final = src_folder / f"{info.path.stem}{output.suffix}"   # take original's name
+            remove_orig = True
+        else:
+            final = src_folder / f"{info.path.stem}_plex{output.suffix}"
+            remove_orig = False
+
+        # Output already exactly where it belongs (non-local, output-exists case)
+        if output.exists() and final.exists() and output.samefile(final):
+            return final
+
+        if remove_orig and info.path.exists() and \
+                info.path.resolve() != final.resolve():
+            self._safe_unlink_retry(info.path)
+            self._conv_log(f"  [del] original removed: {info.path.name}")
+        return self._safe_move_retry(output, final)
+
     def _conv_finalize_success(self, info: FileInfo, output: Path, s: dict,
                                 pre_size: int, pre_mtime: float, conv_hash: str) -> str:
         """Called after a successful (ret==0) encode.  Decides whether to keep the
@@ -2351,23 +2491,21 @@ class App(tk.Tk):
                     output.unlink()
             except OSError:
                 pass
+            self._stage_cleanup(info)   # remove local source copy if staged
             # Record so we don't keep retrying a file that only grows
             self._history_record_at(info.path, pre_size, pre_mtime, conv_hash)
             return "Skipped"
 
-        # New file is smaller → commit it
+        # New file is smaller → commit it to its final network location
         self._conv_log(
             f"[done] {info.path.name}  "
             f"{info.size_mb:.0f} MB → {out_mb:.0f} MB  ({ratio:.0f}%)")
         self._history_record_at(info.path, pre_size, pre_mtime, conv_hash)
-        if s.get("replace_orig") and output.exists():
-            self._conv_do_replace_original(info, output)
-        elif s.get("del_orig") and output.exists():
-            try:
-                info.path.unlink()
-                self._conv_log("  [del] original removed")
-            except OSError:
-                pass
+        # Unify replace/del/keep + local-staged copy-back into one path
+        if s.get("replace_orig") or s.get("del_orig") or info.work_path is not None:
+            self._commit_to_network(info, output, s)
+        # else: not staged and not replacing → output already sits beside source
+        self._stage_cleanup(info)       # remove local source copy if staged
         return "Done"
 
     def _conv_do_replace_original(self, info: FileInfo, output: Path) -> Path:
@@ -2542,6 +2680,9 @@ class App(tk.Tk):
         if n_parallel > 1:
             self._conv_log(
                 f"[parallel] Running up to {n_parallel} concurrent job(s).")
+        if s.get("local_work"):
+            self._conv_log(f"[local] copy-local processing → {s['local_work']}")
+        self._sweep_work_folder(s)
 
         def _inc_done():
             with done_lock:
@@ -2608,13 +2749,24 @@ class App(tk.Tk):
                 _inc_done()
                 return
 
-            output = self._conv_output_path(info, s)
-            if output.exists() and not s.get("overwrite"):
-                info.status = "Skipped"
-                self._conv_log(f"[skip] {info.path.name}  (output exists)")
+            # Output-exists check (uses network path before staging)
+            if not s.get("local_work"):
+                _net_out = self._conv_output_path(info, s)
+                if _net_out.exists() and not s.get("overwrite"):
+                    info.status = "Skipped"
+                    self._conv_log(f"[skip] {info.path.name}  (output exists)")
+                    self.after(0, self._conv_refresh_row, info)
+                    _inc_done()
+                    return
+
+            # Copy to local fast disk if a work folder is configured
+            if not self._stage_in(info, s):
+                info.status = "Error"
                 self.after(0, self._conv_refresh_row, info)
                 _inc_done()
                 return
+
+            output = self._conv_output_path(info, s)
 
             # Capture pre-conversion stats for history
             pre_size, pre_mtime = 0, 0.0
@@ -2703,12 +2855,15 @@ class App(tk.Tk):
                 _process_one(info)
             except Exception as exc:
                 self._conv_log(f"[err] {info.path.name}: unhandled exception — {exc}")
+                self._note_drive_loss(exc)
                 info.status = "Error"
                 self.after(0, self._conv_refresh_row, info)
                 with done_lock:
                     done_count[0] += 1
                     d = done_count[0]
                 self.after(0, self._conv_set_overall, d, total)
+            finally:
+                self._stage_cleanup(info)   # always remove the local source copy
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=n_parallel) as pool:
             list(pool.map(_safe_process_one, files))
@@ -2755,6 +2910,7 @@ class App(tk.Tk):
             "skip_logged":       self._conv_skip_logged_var.get(),
             "log_completed":     set(self._log_completed),               # frozen copy
             "min_kbps":          float(self._conv_min_mbps_var.get()) * 1000.0,
+            "local_work":        self._conv_local_work_var.get().strip(),
         }
         # Target-aware skip: rank of the chosen output video codec
         s["target_vrank"] = _target_vrank(s["vcodec"])
@@ -2767,7 +2923,11 @@ class App(tk.Tk):
         return s
 
     def _conv_output_path(self, info: FileInfo, s: dict) -> Path:
-        ext     = s["container"]
+        ext = s["container"]
+        # Local-staged: write the encode output right next to the local copy on
+        # fast disk.  _commit_to_network() moves it back to the server afterwards.
+        if info.work_path is not None:
+            return info.work_path.parent / f"{info.work_path.stem}_plex.{ext}"
         out_s   = s["output_dir"]
         out_dir = info.path.parent if out_s == "Same as source" else Path(out_s)
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -2791,7 +2951,8 @@ class App(tk.Tk):
         elif "AMD" in hw:
             cmd += ["-hwaccel", "d3d11va"]
 
-        cmd += ["-i", str(info.path)]
+        # Read from the local staged copy when present, else the source directly
+        cmd += ["-i", str(info.work_path or info.path)]
         cmd += ["-y" if s["overwrite"] else "-n"]
 
         # Video codec
@@ -3030,9 +3191,12 @@ class App(tk.Tk):
             f"  skip_compat={skip_compat}  skip_processed={conv_skip_proc}  "
             f"no_change={no_change}  preset={s.get('preset')}\n")
         self._output_q.put(f"Keeping languages: {sorted(keep_langs)}\n")
+        if s.get("local_work"):
+            self._output_q.put(f"[local] copy-local processing → {s['local_work']}\n")
         if dry_run:
             self._output_q.put("[DRY RUN — TM will not modify files]\n")
         self._output_q.put("\n")
+        self._sweep_work_folder(s)
 
         # ── Dry run: Track Manager only, no encoding ─────────────────────────
         if dry_run:
@@ -3145,11 +3309,18 @@ class App(tk.Tk):
                     f"[encode] {f.name}  {info.video_codec}/{info.audio_codec}  "
                     f"→ rank {_codec_rank(info.video_codec)} < target {target_vrank}")
 
-                output = self._conv_output_path(info, s)
-                if output.exists() and not s.get("overwrite"):
-                    self._conv_log(f"[skip] {f.name}  (output exists)")
+                if not s.get("local_work"):
+                    _net_out = self._conv_output_path(info, s)
+                    if _net_out.exists() and not s.get("overwrite"):
+                        self._conv_log(f"[skip] {f.name}  (output exists)")
+                        _inc_done()
+                        return
+
+                if not self._stage_in(info, s):
                     _inc_done()
                     return
+
+                output = self._conv_output_path(info, s)
 
                 pre_size, pre_mtime = 0, 0.0
                 try:
@@ -3216,6 +3387,8 @@ class App(tk.Tk):
                 self._conv_log(f"[err] {info.path.name}: unexpected — {exc}")
                 self._note_drive_loss(exc)
                 _inc_done()
+            finally:
+                self._stage_cleanup(info)   # always remove the local source copy
 
         def _worker():
             while not _stopped():
@@ -3354,8 +3527,11 @@ class App(tk.Tk):
             f"—  TM  →  Encoder × {n_parallel}\n"
             f"  skip_compat={skip_compat}  skip_processed={conv_skip_proc}  "
             f"no_change={no_change}  preset={s.get('preset')}")
+        if s.get("local_work"):
+            self._conv_log(f"[local] copy-local processing → {s['local_work']}")
         if dry_run:
             self._conv_log("[DRY RUN — TM will not modify files]")
+        self._sweep_work_folder(s)
 
         def _inc_done():
             with done_lock:
@@ -3495,13 +3671,22 @@ class App(tk.Tk):
                     f"skip_compat={skip_compat}  "
                     f"src_rank={_codec_rank(info.video_codec)} < target={target_vrank}")
 
-                output = self._conv_output_path(info, s)
-                if output.exists() and not s.get("overwrite"):
-                    info.status = "Skipped"
-                    self._conv_log(f"[skip] {info.path.name}  (output exists)")
+                if not s.get("local_work"):
+                    _net_out = self._conv_output_path(info, s)
+                    if _net_out.exists() and not s.get("overwrite"):
+                        info.status = "Skipped"
+                        self._conv_log(f"[skip] {info.path.name}  (output exists)")
+                        self.after(0, self._conv_refresh_row, info)
+                        _inc_done()
+                        return
+
+                if not self._stage_in(info, s):
+                    info.status = "Error"
                     self.after(0, self._conv_refresh_row, info)
                     _inc_done()
                     return
+
+                output = self._conv_output_path(info, s)
 
                 pre_size, pre_mtime = 0, 0.0
                 try:
@@ -3578,6 +3763,8 @@ class App(tk.Tk):
                 info.status = "Error"
                 self.after(0, self._conv_refresh_row, info)
                 _inc_done()
+            finally:
+                self._stage_cleanup(info)   # always remove the local source copy
 
         def _worker():
             while not self._conv_stop_flag.is_set():
