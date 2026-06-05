@@ -233,6 +233,17 @@ _PLEX_AUDIO = {"aac", "mp3", "ac3", "eac3", "dts", "opus", "flac", "truehd"}
 _PLEX_CONTAINERS = {".mp4", ".mkv", ".mov"}
 
 
+def _ext_path(p) -> str:
+    """Return a Windows extended-length path (\\\\?\\…) so file operations work
+    on paths longer than MAX_PATH (260).  No-op on non-Windows."""
+    s = os.path.abspath(str(p))
+    if os.name != "nt" or s.startswith("\\\\?\\"):
+        return s
+    if s.startswith("\\\\"):                 # UNC  \\server\share\…
+        return "\\\\?\\UNC\\" + s[2:]
+    return "\\\\?\\" + s                      # drive  C:\…  /  mapped P:\…
+
+
 def _codec_rank(codec: str) -> int:
     c = (codec or "").lower()
     if "av1" in c:
@@ -2367,10 +2378,15 @@ class App(tk.Tk):
         try:
             wd = Path(work_dir)
             wd.mkdir(parents=True, exist_ok=True)
-            dst = wd / info.path.name
-            shutil.copy2(info.path, dst)        # one bulk sequential read
+            # SHORT scratch name (hash of the source path) so the local path can
+            # never exceed Windows MAX_PATH (260) — anime filenames can be 250+
+            # chars, which breaks ffmpeg's output-open with 'Invalid argument'.
+            short = "wk_" + hashlib.md5(str(info.path).encode()).hexdigest()[:12] \
+                + info.path.suffix
+            dst = wd / short
+            shutil.copy2(_ext_path(info.path), _ext_path(dst))   # bulk sequential read
             info.work_path = dst
-            self._conv_log(f"  [local] staged → {dst.name}")
+            self._conv_log(f"  [local] staged {info.path.name[:50]}…  →  {short}")
             return True
         except Exception as exc:
             self._conv_log(f"  [local] copy-in failed: {exc}")
@@ -2414,7 +2430,7 @@ class App(tk.Tk):
     def _safe_unlink_retry(self, path: Path, tries: int = 6, delay: int = 5) -> bool:
         for attempt in range(tries):
             try:
-                path.unlink()
+                os.remove(_ext_path(path))   # extended-length: handles >260-char paths
                 return True
             except FileNotFoundError:
                 return True
@@ -2430,12 +2446,21 @@ class App(tk.Tk):
 
     def _safe_move_retry(self, src: Path, dst: Path,
                          tries: int = 6, delay: int = 5) -> Path:
-        """shutil.move with retry — handles same-drive (atomic) and cross-drive
-        (local→network copy) plus transient Plex/AV locks."""
+        """Move src → dst with retry, using extended-length paths so it works on
+        >260-char destinations.  Same-volume = atomic rename; cross-volume
+        (local→network) = copy then delete.  Retries transient Plex/AV locks."""
+        es, ed = _ext_path(src), _ext_path(dst)
         for attempt in range(tries):
             try:
-                shutil.move(str(src), str(dst))
-                self._conv_log(f"  [moved] {src.name} → {dst}")
+                try:
+                    os.replace(es, ed)              # atomic on same volume
+                except OSError:
+                    shutil.copy2(es, ed)            # cross-volume: copy back…
+                    try:
+                        os.remove(es)               # …then drop the local copy
+                    except OSError:
+                        pass
+                self._conv_log(f"  [moved] {Path(src).name} → {dst}")
                 return dst
             except OSError as e:
                 if attempt < tries - 1:
