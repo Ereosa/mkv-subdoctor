@@ -2302,6 +2302,33 @@ class App(tk.Tk):
 
     # ── Video Converter: replace-original helper ──────────────────────────────
 
+    def _note_drive_loss(self, exc) -> bool:
+        """If *exc* looks like a disconnected drive (common with network/mapped
+        drives), halt the whole run cleanly with one clear banner instead of
+        letting every remaining file fail.  Returns True if a drive loss was
+        detected."""
+        winerr = getattr(exc, "winerror", None)
+        text   = str(exc).lower()
+        # 53 network path not found · 64 name no longer available ·
+        # 67 network name cannot be found · 1167 device not connected
+        drive_gone = winerr in (53, 64, 67, 1167) or "network path" in text \
+            or "network name" in text
+        if not drive_gone:
+            return False
+        if not self._conv_stop_flag.is_set():
+            self._conv_log(
+                "\n" + "=" * 60 +
+                "\n  DRIVE DISCONNECTED — a source/output drive is no longer "
+                "reachable.\n  Stopping the run so nothing is lost.  Reconnect "
+                "the drive and\n  re-run; already-finished files are skipped "
+                "automatically.\n" + "=" * 60)
+        self._conv_stop_flag.set()
+        try:
+            core._stop_event.set()
+        except Exception:
+            pass
+        return True
+
     def _conv_finalize_success(self, info: FileInfo, output: Path, s: dict,
                                 pre_size: int, pre_mtime: float, conv_hash: str) -> str:
         """Called after a successful (ret==0) encode.  Decides whether to keep the
@@ -2659,6 +2686,7 @@ class App(tk.Tk):
             except Exception as exc:
                 info.status = "Error"
                 self._conv_log(f"[err]  {info.path.name}: {exc}")
+                self._note_drive_loss(exc)
                 if proc is not None:
                     with self._conv_procs_lock:
                         try:
@@ -3078,6 +3106,7 @@ class App(tk.Tk):
             except Exception as exc:
                 self._output_q.put(f"  TM ERROR {f.name}: {exc}\n")
                 info.status = "Error"
+                self._note_drive_loss(exc)
                 return "skip"
 
         def _encode_file(info: FileInfo):
@@ -3173,6 +3202,7 @@ class App(tk.Tk):
 
                 except Exception as exc:
                     self._conv_log(f"[err] {f.name}: {exc}")
+                    self._note_drive_loss(exc)
                     if proc is not None:
                         with self._conv_procs_lock:
                             try:
@@ -3184,6 +3214,7 @@ class App(tk.Tk):
 
             except Exception as exc:
                 self._conv_log(f"[err] {info.path.name}: unexpected — {exc}")
+                self._note_drive_loss(exc)
                 _inc_done()
 
         def _worker():
@@ -3410,6 +3441,7 @@ class App(tk.Tk):
                 self._output_q.put(f"  TM ERROR {info.path.name}: {exc}\n")
                 info.status = "Error"
                 self.after(0, self._conv_refresh_row, info)
+                self._note_drive_loss(exc)
                 return "skip"
 
         def _encode_file(info: FileInfo):
@@ -3527,6 +3559,7 @@ class App(tk.Tk):
                 except Exception as exc:
                     info.status = "Error"
                     self._conv_log(f"[err] {info.path.name}: {exc}")
+                    self._note_drive_loss(exc)
                     if proc is not None:
                         with self._conv_procs_lock:
                             try:
@@ -3541,6 +3574,7 @@ class App(tk.Tk):
             except Exception as exc:
                 # Outer catch — keeps the pool worker alive on any unexpected error
                 self._conv_log(f"[err] {info.path.name}: unexpected — {exc}")
+                self._note_drive_loss(exc)
                 info.status = "Error"
                 self.after(0, self._conv_refresh_row, info)
                 _inc_done()
