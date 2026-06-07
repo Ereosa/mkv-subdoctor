@@ -2964,17 +2964,16 @@ class App(tk.Tk):
     def _conv_build_cmd(self, info: FileInfo, output: Path, s: dict) -> List[str]:
         cmd: List[str] = [self._ffmpeg, "-hide_banner", "-loglevel", "info"]
 
-        # Hardware-accelerated decode
         hw = s["hwaccel"]
-        if "NVIDIA" in hw:
-            # -hwaccel cuda uses NVDEC for fast GPU decode.
-            # Omitting -hwaccel_output_format cuda so decoded frames land in
-            # CPU memory — required for scale/pad filters to work with hevc_nvenc.
-            cmd += ["-hwaccel", "cuda"]
-        elif "Intel" in hw:
-            cmd += ["-hwaccel", "qsv"]
-        elif "AMD" in hw:
-            cmd += ["-hwaccel", "d3d11va"]
+        # NOTE: We deliberately do NOT force a hardware DECODER (e.g. -hwaccel cuda).
+        # Much anime is 10-bit h264 (Hi10P), which NVIDIA NVDEC cannot decode at
+        # all — forcing it printed "Failed setup for format cuda" on every file
+        # and fell back to CPU anyway.  CPU decode is cheap and reliable; the GPU
+        # is still used for the heavy ENCODE via -c:v hevc_nvenc/etc. below.
+        # -hwaccel auto lets ffmpeg use GPU decode only when the input is actually
+        # supported, falling back quietly otherwise.
+        if "NVIDIA" in hw or "Intel" in hw or "AMD" in hw:
+            cmd += ["-hwaccel", "auto"]
 
         # Read from the local staged copy when present, else the source directly
         cmd += ["-i", str(info.work_path or info.path)]
