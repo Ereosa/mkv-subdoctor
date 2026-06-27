@@ -33,6 +33,8 @@ Requirements:
 
 import concurrent.futures
 import contextlib
+import ctypes
+import ctypes.wintypes
 import hashlib
 import json
 import os
@@ -74,6 +76,8 @@ _APP_DATA.mkdir(parents=True, exist_ok=True)
 _CONFIG     = _APP_DATA / "config.json"
 _HISTORY    = _APP_DATA / "history.json"
 _DONE_LOG   = _APP_DATA / "completed_from_logs.json"   # filenames marked done in logs
+_AUTO_LOGS  = _APP_DATA / "auto_logs"                  # daily run logs written on each completion
+_AUTO_LOGS.mkdir(parents=True, exist_ok=True)
 
 # One-time migration: pull config from script dir if the shared one is absent
 for _old in (_SCRIPT_DIR / "mkv_subdoctor_config.json",
@@ -282,6 +286,7 @@ class FileInfo:
     progress:    float = 0.0
     row_id:      str  = ""
     work_path:   Optional[Path] = None   # local scratch copy while staged
+    probe_failed: bool = False            # ffprobe returned no output
 
     @property
     def source_kbps(self) -> float:
@@ -446,6 +451,7 @@ class App(tk.Tk):
                     "conv_skip_logged":     self._conv_skip_logged_var.get(),
                     "conv_parallel":        self._conv_parallel_var.get(),
                     "conv_min_mbps":        self._conv_min_mbps_var.get(),
+                    "conv_bloat_max_mbps":  self._conv_bloat_max_mbps_var.get(),
                     "conv_local_work":      self._conv_local_work_var.get(),
                 })
 
@@ -526,6 +532,7 @@ class App(tk.Tk):
         self._conv_skip_logged_var.set( prefs.get("conv_skip_logged",    False))
         self._conv_parallel_var.set(    prefs.get("conv_parallel",       2))
         self._conv_min_mbps_var.set(    prefs.get("conv_min_mbps",       2.5))
+        self._conv_bloat_max_mbps_var.set(prefs.get("conv_bloat_max_mbps", 0.0))
         self._conv_local_work_var.set(  prefs.get("conv_local_work",     ""))
 
         # Update preset description label
@@ -583,6 +590,34 @@ class App(tk.Tk):
             and entry.get("op_hash") == op_hash
         )
 
+    def _history_check_bloat(self, path: Path, op_hash: str) -> bool:
+        """Like _history_check but also recognises replace-orig encodes where
+        the history entry pre-dates our post-replace re-record fix.
+
+        When a file is encoded and the original is replaced, the old code only
+        recorded the PRE-encode size/mtime.  The new file on disk is smaller,
+        so _history_check fails (size mismatch).  This variant also returns
+        True when the recorded size is LARGER than the current file — that
+        pattern means the file was successfully encoded and replaced.
+        """
+        try:
+            st = path.stat()
+        except OSError:
+            return False
+        with self._history_lock:
+            history = self._history_load()
+        entry = history.get(str(path))
+        if not entry or entry.get("op_hash") != op_hash:
+            return False
+        # Exact match (normal case, or post-replace re-record)
+        if (entry.get("size") == st.st_size
+                and abs(entry.get("mtime", 0) - st.st_mtime) <= 2.0):
+            return True
+        # Recorded size is larger → file was encoded and replaced with something
+        # smaller.  The original stats are what's in history; the current file
+        # is the smaller output.  Treat as already done.
+        return entry.get("size", 0) > st.st_size
+
     def _history_record(self, path: Path, op_hash: str):
         """Record a successful processing run for *path* using its current stats."""
         try:
@@ -620,13 +655,42 @@ class App(tk.Tk):
     # ── Completed-from-logs (skip files marked [done] in a saved log) ──────────
 
     def _load_completed_log(self) -> set:
-        """Load the persisted set of filenames previously marked done in logs."""
+        """Load the persisted set of filenames previously marked done in logs.
+        Also scans auto_logs/ so completions from any previous session are
+        picked up automatically without the user having to import anything."""
+        names: set = set()
         try:
             if _DONE_LOG.exists():
-                return set(json.loads(_DONE_LOG.read_text(encoding="utf-8")))
+                names = set(json.loads(_DONE_LOG.read_text(encoding="utf-8")))
         except Exception:
             pass
-        return set()
+        try:
+            for p in sorted(_AUTO_LOGS.glob("*.log")):
+                try:
+                    text = p.read_text(encoding="utf-8", errors="replace")
+                    names.update(self._parse_log_for_filenames(text))
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        return names
+
+    def _auto_log_done(self, filename: str, src_mb: float, out_mb: float):
+        """Append a [done] line to today's auto-log immediately after a successful
+        encode so restarts never re-process files that already finished."""
+        import datetime
+        try:
+            log_path = _AUTO_LOGS / f"{datetime.date.today()}.log"
+            ratio = out_mb / src_mb * 100 if src_mb else 0
+            line = f"[done] {filename}  {src_mb:.0f} MB → {out_mb:.0f} MB  ({ratio:.0f}%)\n"
+            with open(log_path, "a", encoding="utf-8") as fh:
+                fh.write(line)
+                fh.flush()
+            # Also add to the in-memory set so skip-logged takes effect immediately
+            self._log_completed.add(filename)
+            self._update_log_count_label()
+        except Exception:
+            pass
 
     def _save_completed_log(self):
         try:
@@ -1401,6 +1465,8 @@ class App(tk.Tk):
         self._conv_overall_lbl = ttk.Label(pf, text="0 / 0", width=9)
         self._conv_overall_lbl.pack(side="left")
 
+        self._conv_tree.bind("<Button-3>", self._conv_tree_right_click)
+
         # Tree tag colours (set again by _apply_theme)
         self._conv_tree.tag_configure("done",       foreground="#a6e3a1")
         self._conv_tree.tag_configure("error",      foreground="#f38ba8")
@@ -1582,7 +1648,7 @@ class App(tk.Tk):
                         variable=self._conv_skip_processed_var).pack(anchor="w", padx=8, pady=2)
 
         # Skip files marked [done] in a previously-saved log (survives setting changes)
-        self._conv_skip_logged_var = tk.BooleanVar(value=False)
+        self._conv_skip_logged_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(optf, text="Skip files completed in imported logs",
                         variable=self._conv_skip_logged_var).pack(anchor="w", padx=8, pady=2)
         log_row = ttk.Frame(optf)
@@ -1611,6 +1677,17 @@ class App(tk.Tk):
         ttk.Spinbox(mb_row, from_=0.0, to=50.0, increment=0.5, width=5,
                     textvariable=self._conv_min_mbps_var).pack(side="left", padx=6)
         ttk.Label(mb_row, text="Mbps  (0 = never skip)").pack(side="left")
+
+        # Re-encode already-HEVC files that are bloated above this bitrate threshold.
+        # Punches through the skip-compat check so old high-bitrate HEVC encodes get
+        # re-compressed even though they're already at the target codec.
+        bm_row = ttk.Frame(optf)
+        bm_row.pack(fill="x", padx=8, pady=4)
+        ttk.Label(bm_row, text="Re-encode HEVC above:").pack(side="left")
+        self._conv_bloat_max_mbps_var = tk.DoubleVar(value=0.0)
+        ttk.Spinbox(bm_row, from_=0.0, to=200.0, increment=1.0, width=5,
+                    textvariable=self._conv_bloat_max_mbps_var).pack(side="left", padx=6)
+        ttk.Label(bm_row, text="Mbps  (0 = disabled)").pack(side="left")
 
         # Local work folder — copy each file to fast local disk, process there,
         # then copy the result back.  Minimises exposure to a slow/flaky network
@@ -1974,6 +2051,40 @@ class App(tk.Tk):
 
         self.after(100, self._poll_output)
 
+    # ── Shutdown / sleep prevention ───────────────────────────────────────────
+
+    def _block_shutdown(self):
+        """Prevent Windows from sleeping or force-restarting while a run is active.
+
+        SetThreadExecutionState stops the display/system from sleeping.
+        ShutdownBlockReasonCreate makes Windows show a "MKV SubDoctor is busy"
+        dialog instead of silently force-rebooting (e.g. Windows Update).
+        """
+        try:
+            ES_CONTINUOUS        = 0x80000000
+            ES_SYSTEM_REQUIRED   = 0x00000001
+            ES_AWAYMODE_REQUIRED = 0x00000040
+            ctypes.windll.kernel32.SetThreadExecutionState(
+                ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_AWAYMODE_REQUIRED)
+            hwnd = ctypes.wintypes.HWND(self.winfo_id())
+            ctypes.windll.user32.ShutdownBlockReasonCreate(
+                hwnd,
+                ctypes.c_wchar_p("MKV SubDoctor: video conversion in progress"))
+            self._shutdown_blocked = True
+        except Exception:
+            pass
+
+    def _unblock_shutdown(self):
+        """Re-enable shutdown and sleep after a run finishes or is stopped."""
+        try:
+            ES_CONTINUOUS = 0x80000000
+            ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS)
+            hwnd = ctypes.wintypes.HWND(self.winfo_id())
+            ctypes.windll.user32.ShutdownBlockReasonDestroy(hwnd)
+            self._shutdown_blocked = False
+        except Exception:
+            pass
+
     # ── Track Manager: processing control ────────────────────────────────────
 
     def _start(self):
@@ -2013,6 +2124,7 @@ class App(tk.Tk):
         self._combined_btn.configure(state="disabled")
         self._conv_start_btn.configure(state="disabled")
         self._conv_combined_btn.configure(state="disabled")
+        self._block_shutdown()
 
         tm_skip_processed = self._tm_skip_processed_var.get()   # main thread
         self._worker = threading.Thread(
@@ -2042,6 +2154,7 @@ class App(tk.Tk):
         self._status_lbl.configure(text="Stopping after current file…")
 
     def _on_done(self):
+        self._unblock_shutdown()
         self._start_btn.configure(state="normal")
         self._pause_btn.configure(state="disabled", text="  Pause")
         self._stop_btn.configure(state="disabled")
@@ -2246,18 +2359,55 @@ class App(tk.Tk):
         with self._conv_probe_sem:
             self._conv_do_probe(info)
 
+    def _ffprobe_json(self, path: Path) -> Optional[str]:
+        """Run ffprobe on *path* and return the JSON string, or None on failure.
+
+        Uses a temp file for stdout instead of a pipe — avoids the Windows
+        pipe-capture bug where specific files produce rc=0 with empty stdout
+        despite producing valid output when redirected to a file."""
+        import tempfile
+        tmp = None
+        try:
+            fd, tmp = tempfile.mkstemp(suffix=".json")
+            os.close(fd)
+            with open(tmp, "wb") as out_fh:
+                rc = subprocess.call(
+                    [self._ffprobe,
+                     "-v", "error",
+                     "-probesize", "100M",
+                     "-analyzeduration", "5000000",
+                     "-print_format", "json",
+                     "-show_streams", "-show_format",
+                     str(path)],
+                    stdout=out_fh,
+                    stderr=subprocess.DEVNULL,
+                    timeout=60,
+                    creationflags=_NO_WINDOW,
+                )
+            with open(tmp, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read()
+            return content if content.strip() else None
+        except Exception:
+            return None
+        finally:
+            if tmp:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+
     def _conv_do_probe(self, info: FileInfo):
         try:
-            result = subprocess.run(
-                [self._ffprobe, "-v", "quiet", "-print_format", "json",
-                 "-show_streams", "-show_format", str(info.path)],
-                capture_output=True, text=True, timeout=30,
-                creationflags=_NO_WINDOW,
-            )
-            if not result.stdout:
-                self._conv_log(f"Probe warning — no output for: {info.path.name}")
+            raw = self._ffprobe_json(info.path)
+            if not raw:
+                self._conv_log(
+                    f"Probe warning — {info.path.name} — trying mkvmerge fallback…")
+                if info.path.suffix.lower() == ".mkv":
+                    self._conv_probe_mkvmerge(info)
+                if not info.probe_failed:
+                    self.after(0, self._conv_refresh_row, info)
                 return
-            data = json.loads(result.stdout)
+            data = json.loads(raw)
 
             for stream in data.get("streams", []):
                 ct = stream.get("codec_type", "")
@@ -2281,6 +2431,74 @@ class App(tk.Tk):
         except Exception as e:
             self._conv_log(f"Probe error — {info.path.name}: {e}")
 
+    def _conv_probe_mkvmerge(self, info: FileInfo):
+        """Fallback probe using mkvmerge --identify for files that ffprobe can't read."""
+        try:
+            mkvmerge = core.find_tool("mkvmerge")
+        except Exception:
+            mkvmerge = None
+        if not mkvmerge:
+            self._conv_log(f"  mkvmerge fallback skipped — mkvmerge not found")
+            info.probe_failed = True
+            return
+        try:
+            result = subprocess.run(
+                [mkvmerge, "--identify", "--identification-format", "json",
+                 str(info.path)],
+                capture_output=True, text=True, timeout=60,
+                creationflags=_NO_WINDOW,
+            )
+            if not result.stdout:
+                detail = (result.stderr.strip().splitlines()[-1]
+                          if result.stderr.strip() else "no detail")
+                self._conv_log(
+                    f"  mkvmerge fallback also failed (rc={result.returncode}): {detail}")
+                info.probe_failed = True
+                return
+            data = json.loads(result.stdout)
+
+            # mkvmerge JSON: {"tracks": [{"type": "video", "codec": "HEVC", ...}]}
+            for track in data.get("tracks", []):
+                t = track.get("type", "")
+                props = track.get("properties", {})
+                codec_id = track.get("codec", "")
+                if t == "video" and info.video_codec == "—":
+                    # Normalise to ffprobe-style codec names
+                    c = codec_id.upper()
+                    if "HEVC" in c or "H.265" in c or "H265" in c:
+                        info.video_codec = "hevc"
+                    elif "AVC" in c or "H.264" in c or "H264" in c:
+                        info.video_codec = "h264"
+                    elif "AV1" in c:
+                        info.video_codec = "av1"
+                    else:
+                        info.video_codec = codec_id or "?"
+                    w = props.get("display_dimensions", "").split("x")
+                    pw = props.get("pixel_dimensions", "")
+                    if pw:
+                        info.resolution = pw.replace("x", "×")
+                    elif len(w) == 2:
+                        info.resolution = f"{w[0]}×{w[1]}"
+                elif t == "audio" and info.audio_codec == "—":
+                    info.audio_codec = codec_id or "?"
+
+            # Duration from container info (nanoseconds → seconds)
+            container = data.get("container", {})
+            props_c = container.get("properties", {})
+            dur_ns = props_c.get("duration")
+            if dur_ns:
+                info.duration = int(dur_ns) / 1_000_000_000
+            # Bitrate: mkvmerge doesn't report it directly; fall back to size/duration
+            self._conv_log(
+                f"  mkvmerge fallback OK — {info.path.name}: "
+                f"{info.video_codec} {info.resolution} / {info.audio_codec}")
+        except json.JSONDecodeError as e:
+            self._conv_log(f"  mkvmerge fallback bad JSON — {info.path.name}: {e}")
+            info.probe_failed = True
+        except Exception as e:
+            self._conv_log(f"  mkvmerge fallback error — {info.path.name}: {e}")
+            info.probe_failed = True
+
     # ── Video Converter: synchronous probe (no treeview update) ──────────────
 
     def _conv_probe_sync(self, info: FileInfo):
@@ -2289,15 +2507,14 @@ class App(tk.Tk):
         if not self._ffprobe:
             return
         try:
-            result = subprocess.run(
-                [self._ffprobe, "-v", "quiet", "-print_format", "json",
-                 "-show_streams", "-show_format", str(info.path)],
-                capture_output=True, text=True, timeout=30,
-                creationflags=_NO_WINDOW,
-            )
-            if not result.stdout:
+            raw = self._ffprobe_json(info.path)
+            if not raw:
+                if info.path.suffix.lower() == ".mkv":
+                    self._conv_probe_mkvmerge(info)
+                else:
+                    info.probe_failed = True
                 return
-            data = json.loads(result.stdout)
+            data = json.loads(raw)
             for stream in data.get("streams", []):
                 ct = stream.get("codec_type", "")
                 if ct == "video" and info.video_codec == "—":
@@ -2317,6 +2534,44 @@ class App(tk.Tk):
             pass  # duration stays 0; progress won't show percentage
 
     # ── Video Converter: tree row update ──────────────────────────────────────
+
+    def _conv_tree_right_click(self, event):
+        tree = self._conv_tree
+        iid = tree.identify_row(event.y)
+        if not iid:
+            return
+        # Select clicked row if it isn't already part of the selection
+        if iid not in tree.selection():
+            tree.selection_set(iid)
+        sel_iids = tree.selection()
+        infos = [f for f in self._conv_files if f.row_id in sel_iids]
+        if not infos:
+            return
+        menu = tk.Menu(self, tearoff=False)
+        menu.add_command(label="Mark as Done",
+                         command=lambda: self._conv_mark_done(infos))
+        menu.add_command(label="Mark as Skipped",
+                         command=lambda: self._conv_mark_skipped(infos))
+        menu.add_command(label="Reset to Pending",
+                         command=lambda: self._conv_mark_pending(infos))
+        menu.tk_popup(event.x_root, event.y_root)
+
+    def _conv_mark_done(self, infos):
+        op_hash = self._compute_conv_hash()
+        for info in infos:
+            info.status = "Done"
+            self._history_record(info.path, op_hash)
+            self._conv_refresh_row(info)
+
+    def _conv_mark_skipped(self, infos):
+        for info in infos:
+            info.status = "Skipped"
+            self._conv_refresh_row(info)
+
+    def _conv_mark_pending(self, infos):
+        for info in infos:
+            info.status = "Pending"
+            self._conv_refresh_row(info)
 
     def _conv_refresh_row(self, info: FileInfo, prog_text: str = ""):
         if not info.row_id or not self._conv_tree.exists(info.row_id):
@@ -2525,10 +2780,15 @@ class App(tk.Tk):
         self._conv_log(
             f"[done] {info.path.name}  "
             f"{info.size_mb:.0f} MB → {out_mb:.0f} MB  ({ratio:.0f}%)")
+        self._auto_log_done(info.path.name, info.size_mb, out_mb)
         self._history_record_at(info.path, pre_size, pre_mtime, conv_hash)
         # Unify replace/del/keep + local-staged copy-back into one path
         if s.get("replace_orig") or s.get("del_orig") or info.work_path is not None:
-            self._commit_to_network(info, output, s)
+            final = self._commit_to_network(info, output, s)
+            # The file on disk is now the re-encoded output (different size/mtime).
+            # Re-record history against the final file's stats so that skip_processed
+            # and the bloat-override check both recognise it on the next run.
+            self._history_record(final, conv_hash)
         # else: not staged and not replacing → output already sits beside source
         self._stage_cleanup(info)       # remove local source copy if staged
         return "Done"
@@ -2604,6 +2864,7 @@ class App(tk.Tk):
         self._combined_btn.configure(state="disabled")
         self._conv_combined_btn.configure(state="disabled")
         self._start_btn.configure(state="disabled")
+        self._block_shutdown()
         n_parallel = max(1, self._conv_parallel_var.get())   # read on main thread
         s = self._conv_read_settings()                       # read on main thread
         threading.Thread(
@@ -2634,6 +2895,7 @@ class App(tk.Tk):
         self._conv_stop_btn.configure(state="disabled")
 
     def _conv_on_done(self):
+        self._unblock_shutdown()
         self._conv_converting = False
         self._conv_paused = False
         self._conv_start_btn.configure(state="normal")
@@ -2753,15 +3015,47 @@ class App(tk.Tk):
                 _inc_done()
                 return
 
-            # Skip files already at or above the target codec (target-aware)
-            if s.get("skip_compat") and info.is_at_or_above_target(s.get("target_vrank", 0)):
-                info.status = "Skipped"
+            # Re-probe if codec info is missing (mkvmerge fallback may have partially
+            # succeeded during scan without populating video_codec).
+            if info.video_codec == "—" or info.duration == 0:
+                self._conv_probe_sync(info)
+
+            # If ffprobe returned no output, encoding will also fail — skip it.
+            # Also skip if re-probe still couldn't determine the codec (corrupt file
+            # with a readable header but unreadable video data).
+            if info.probe_failed or info.video_codec == "—":
+                info.status = "Error"
                 self._conv_log(
-                    f"[skip] {info.path.name}  (already ≥ target codec:"
-                    f" {info.video_codec}/{info.audio_codec})")
+                    f"[error] {info.path.name}  (probe failed — ffprobe could not read "
+                    f"this file; check network access and re-run)")
                 self.after(0, self._conv_refresh_row, info)
                 _inc_done()
                 return
+
+            # Skip files already at or above the target codec (target-aware).
+            # Exception: if bloat_max_kbps is set and the file exceeds it, re-encode
+            # regardless — this catches old high-bitrate HEVC that need shrinking.
+            # Guard: never fire the bloat override on a file already in history
+            # (i.e. already re-encoded this session or a previous one), otherwise
+            # replace-orig files get re-encoded every run because their post-encode
+            # size/mtime no longer match the pre-encode history entry until we
+            # re-record it above — and even then, if the output is still > threshold.
+            if s.get("skip_compat") and info.is_at_or_above_target(s.get("target_vrank", 0)):
+                _bloat = s.get("bloat_max_kbps", 0)
+                if (_bloat > 0 and info.source_kbps > _bloat
+                        and not self._history_check_bloat(info.path, conv_hash)):
+                    self._conv_log(
+                        f"[bloat] {info.path.name}  "
+                        f"(already ≥ target codec but {info.source_kbps/1000:.1f} Mbps"
+                        f" > {_bloat/1000:.1f} Mbps threshold — re-encoding)")
+                else:
+                    info.status = "Skipped"
+                    self._conv_log(
+                        f"[skip] {info.path.name}  (already ≥ target codec:"
+                        f" {info.video_codec}/{info.audio_codec})")
+                    self.after(0, self._conv_refresh_row, info)
+                    _inc_done()
+                    return
 
             # Skip already-low-bitrate sources — re-encoding can only bloat them
             _min_kbps = s.get("min_kbps", 0)
@@ -2935,6 +3229,7 @@ class App(tk.Tk):
             "skip_logged":       self._conv_skip_logged_var.get(),
             "log_completed":     set(self._log_completed),               # frozen copy
             "min_kbps":          float(self._conv_min_mbps_var.get()) * 1000.0,
+            "bloat_max_kbps":    float(self._conv_bloat_max_mbps_var.get()) * 1000.0,
             "local_work":        self._conv_local_work_var.get().strip(),
         }
         # Target-aware skip: rank of the chosen output video codec
@@ -3116,6 +3411,7 @@ class App(tk.Tk):
         self._conv_start_btn.configure(state="disabled")
         self._conv_pause_btn.configure(state="disabled")
         self._conv_stop_btn.configure(state="disabled")
+        self._block_shutdown()
 
         _s = self._conv_read_settings()              # snapshot on main thread
         n_parallel = max(1, self._conv_parallel_var.get())   # main thread
@@ -3129,6 +3425,7 @@ class App(tk.Tk):
         self._worker.start()
 
     def _combined_on_done(self):
+        self._unblock_shutdown()
         self._start_btn.configure(state="normal")
         self._pause_btn.configure(state="disabled", text="  Pause")
         self._stop_btn.configure(state="disabled")
@@ -3183,6 +3480,7 @@ class App(tk.Tk):
         skip_compat      = s.get("skip_compat", True)
         target_vrank     = s.get("target_vrank", 0)
         min_kbps         = s.get("min_kbps", 0)
+        bloat_max_kbps   = s.get("bloat_max_kbps", 0)
         no_change        = s.get("no_change", False)
         conv_hash        = s.get("conv_hash", "")
         skip_logged      = s.get("skip_logged", False)
@@ -3316,12 +3614,25 @@ class App(tk.Tk):
                 if info.video_codec == "—" or info.duration == 0:
                     self._conv_probe_sync(info)
 
-                if skip_compat and info.is_at_or_above_target(target_vrank):
+                if info.probe_failed or info.video_codec == "—":
                     self._conv_log(
-                        f"[skip] {f.name}  "
-                        f"(already ≥ target codec: {info.video_codec}/{info.audio_codec})")
+                        f"[error] {f.name}  (probe failed — skipping encode)")
                     _inc_done()
                     return
+
+                if skip_compat and info.is_at_or_above_target(target_vrank):
+                    if (bloat_max_kbps > 0 and info.source_kbps > bloat_max_kbps
+                            and not self._history_check_bloat(f, conv_hash)):
+                        self._conv_log(
+                            f"[bloat] {f.name}  "
+                            f"(already ≥ target codec but {info.source_kbps/1000:.1f} Mbps"
+                            f" > {bloat_max_kbps/1000:.1f} Mbps threshold — re-encoding)")
+                    else:
+                        self._conv_log(
+                            f"[skip] {f.name}  "
+                            f"(already ≥ target codec: {info.video_codec}/{info.audio_codec})")
+                        _inc_done()
+                        return
 
                 if min_kbps > 0 and 0 < info.source_kbps < min_kbps:
                     self._conv_log(
@@ -3486,6 +3797,7 @@ class App(tk.Tk):
         self._conv_pause_btn.configure(state="disabled")
         self._conv_stop_btn.configure(state="normal")     # conv Stop halts ffmpeg
         self._conv_combined_btn.configure(state="disabled")
+        self._block_shutdown()
 
         n_parallel = max(1, self._conv_parallel_var.get())   # read on main thread
         s          = self._conv_read_settings()               # read on main thread
@@ -3498,6 +3810,7 @@ class App(tk.Tk):
         ).start()
 
     def _combined_on_done_conv(self):
+        self._unblock_shutdown()
         self._start_btn.configure(state="normal")
         self._pause_btn.configure(state="disabled", text="  Pause")
         self._stop_btn.configure(state="disabled")
@@ -3534,6 +3847,7 @@ class App(tk.Tk):
         skip_compat      = s.get("skip_compat", True)
         target_vrank     = s.get("target_vrank", 0)
         min_kbps         = s.get("min_kbps", 0)
+        bloat_max_kbps   = s.get("bloat_max_kbps", 0)
         no_change        = s.get("no_change", False)
         conv_hash        = s.get("conv_hash", "")
         skip_logged      = s.get("skip_logged", False)
@@ -3670,14 +3984,29 @@ class App(tk.Tk):
                 if info.video_codec == "—" or info.duration == 0:
                     self._conv_probe_sync(info)
 
-                if skip_compat and info.is_at_or_above_target(target_vrank):
-                    info.status = "Skipped"
+                if info.probe_failed or info.video_codec == "—":
+                    info.status = "Error"
                     self._conv_log(
-                        f"[skip] {info.path.name}  "
-                        f"(already ≥ target codec: {info.video_codec}/{info.audio_codec})")
+                        f"[error] {info.path.name}  (probe failed — skipping encode)")
                     self.after(0, self._conv_refresh_row, info)
                     _inc_done()
                     return
+
+                if skip_compat and info.is_at_or_above_target(target_vrank):
+                    if (bloat_max_kbps > 0 and info.source_kbps > bloat_max_kbps
+                            and not self._history_check_bloat(info.path, conv_hash)):
+                        self._conv_log(
+                            f"[bloat] {info.path.name}  "
+                            f"(already ≥ target codec but {info.source_kbps/1000:.1f} Mbps"
+                            f" > {bloat_max_kbps/1000:.1f} Mbps threshold — re-encoding)")
+                    else:
+                        info.status = "Skipped"
+                        self._conv_log(
+                            f"[skip] {info.path.name}  "
+                            f"(already ≥ target codec: {info.video_codec}/{info.audio_codec})")
+                        self.after(0, self._conv_refresh_row, info)
+                        _inc_done()
+                        return
 
                 if min_kbps > 0 and 0 < info.source_kbps < min_kbps:
                     info.status = "Skipped"
